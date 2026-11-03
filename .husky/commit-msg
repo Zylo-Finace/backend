@@ -1,0 +1,6 @@
+ROOT="$(git rev-parse --show-toplevel)"
+# Drop Cursor agent co-author trailer if the IDE injects it.
+if [ -n "$1" ] && [ -f "$1" ]; then
+  sed -i '/^Co-authored-by: Cursor <cursoragent@cursor.com>$/d' "$1"
+fi
+cd "$ROOT/backend" && npx --no -- commitlint --edit "$1"

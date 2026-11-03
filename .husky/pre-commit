@@ -1,0 +1,4 @@
+ROOT="$(git rev-parse --show-toplevel)"
+# Format and lint only the staged files — a full-repo lint on every commit is
+# slow enough that people start using --no-verify, which defeats the hook.
+cd "$ROOT/backend" && npx lint-staged

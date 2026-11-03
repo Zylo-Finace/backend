@@ -1,0 +1,6 @@
+ROOT="$(git rev-parse --show-toplevel)"
+# Types and unit tests before the code leaves the machine. Deliberately not on
+# pre-commit: developers commit far more often than they push, and a slow commit
+# hook is a hook that gets bypassed.
+cd "$ROOT/backend" && npm run typecheck
+cd "$ROOT/backend" && npm run test -- --passWithNoTests --silent

@@ -1,0 +1,27 @@
+node_modules/
+dist/
+build/
+coverage/
+.tsbuildinfo
+*.tsbuildinfo
+
+# Environment — never commit real secrets. Only .env.example is tracked.
+.env
+.env.*
+!.env.example
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# Editors / OS
+.idea/
+.vscode/*
+!.vscode/extensions.json
+.DS_Store
+
+# Local infrastructure state
+docker/volumes/
+prisma/*.db
