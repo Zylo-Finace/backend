@@ -1,0 +1,79 @@
+name: wabot
+
+# Local development stack. Production uses the same images but is orchestrated
+# separately (docker-compose.prod.yml / Kubernetes) with real secrets, TLS and
+# managed Postgres/Redis.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: wabot-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: wabot
+      POSTGRES_PASSWORD: wabot
+      POSTGRES_DB: wabot
+      # Deterministic collation — avoids index corruption when the host's libc
+      # differs between the machine that built the index and the one that reads it.
+      POSTGRES_INITDB_ARGS: '--encoding=UTF8 --locale=C'
+    command:
+      - postgres
+      # Sized for a dev laptop. Production values are set from the instance class.
+      - -c
+      - max_connections=200
+      - -c
+      - shared_buffers=256MB
+      - -c
+      - effective_cache_size=768MB
+      - -c
+      - work_mem=8MB
+      # Log anything slower than 300ms so N+1s surface during development.
+      - -c
+      - log_min_duration_statement=300
+      - -c
+      - track_io_timing=on
+      # Required for pg_stat_statements query analysis.
+      - -c
+      - shared_preload_libraries=pg_stat_statements
+    ports:
+      - '5432:5432'
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U wabot -d wabot']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  redis:
+    image: redis:7-alpine
+    container_name: wabot-redis
+    restart: unless-stopped
+    command:
+      - redis-server
+      # BullMQ requires keyspace notifications for delayed/scheduled jobs.
+      - --notify-keyspace-events
+      - Ex
+      - --maxmemory
+      - 512mb
+      # `noeviction` is deliberate: BullMQ job state lives in Redis, and silently
+      # evicting a key under memory pressure would lose queued messages. Better to
+      # fail writes loudly and alert.
+      - --maxmemory-policy
+      - noeviction
+      - --appendonly
+      - 'yes'
+    ports:
+      - '6379:6379'
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  postgres-data:
+  redis-data:
