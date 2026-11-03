@@ -1,0 +1,1964 @@
+// =============================================================================
+//  wabot-platform — Prisma schema
+//  Phase 1 slice: tenancy, identity, authorization, auditing.
+//  Later phases append WhatsApp accounts, contacts, conversations, campaigns,
+//  automation and billing. Every tenant-scoped model follows the conventions
+//  documented under "Conventions" below.
+// =============================================================================
+
+generator client {
+  provider        = "prisma-client-js"
+  // `relationJoins` lets Prisma emit real SQL JOINs instead of the default
+  // multi-query strategy — the difference between one round trip and N for
+  // nested reads on conversations and contacts.
+  previewFeatures = ["relationJoins", "nativeDistinct"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// -----------------------------------------------------------------------------
+//  Conventions
+//
+//  id         UUIDv7 — time-ordered, so B-tree inserts stay at the right edge of
+//             the index instead of scattering random pages like UUIDv4. Keeps
+//             high-insert tables (messages, events) from fragmenting.
+//  tenantId   Present on EVERY tenant-owned row and FIRST in every composite
+//             index: Postgres can only use a composite index for a predicate on
+//             its leading column, and every query we issue filters by tenant.
+//  createdAt/updatedAt  Audit columns on everything, no exceptions.
+//  deletedAt  Soft delete. NULL = live. Enforced globally by the Prisma extension.
+//  version    Optimistic-lock counter on rows with concurrent writers.
+// -----------------------------------------------------------------------------
+
+// =============================================================================
+//  TENANCY
+// =============================================================================
+
+enum TenantStatus {
+  TRIAL
+  ACTIVE
+  PAST_DUE
+  SUSPENDED
+  CANCELLED
+}
+
+/// A business using the platform. The root of every ownership chain.
+model Tenant {
+  id     String       @id @default(uuid(7)) @db.Uuid
+  /// URL-safe identifier used for tenant resolution by subdomain.
+  slug   String       @unique @db.VarChar(63)
+  name   String       @db.VarChar(255)
+  status TenantStatus @default(TRIAL)
+
+  /// IANA zone (e.g. "Asia/Kolkata"). Drives business hours and scheduling.
+  timezone String @default("UTC") @db.VarChar(64)
+  locale   String @default("en") @db.VarChar(16)
+
+  /// Denormalised plan snapshot. The billing module owns the authoritative record;
+  /// this copy keeps the hot-path quota check off a join.
+  planKey            String    @default("trial") @db.VarChar(64)
+  planExpiresAt      DateTime?
+  /// Per-tenant overrides for API rate limits. NULL = use the platform default.
+  rateLimitPerMinute Int?
+
+  /// Free-form tenant settings (branding, feature toggles). Validated at the
+  /// service boundary — JSONB keeps schema churn out of migrations.
+  settings Json @default("{}")
+
+  suspendedAt     DateTime?
+  suspendedReason String?   @db.VarChar(512)
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+  version   Int       @default(0)
+
+  memberships Membership[]
+  users       User[]
+  roles       Role[]
+  teams       Team[]
+  apiKeys     ApiKey[]
+  auditLogs   AuditLog[]
+  invitations Invitation[]
+
+  @@index([status])
+  @@index([deletedAt])
+  @@map("tenants")
+}
+
+// =============================================================================
+//  IDENTITY
+// =============================================================================
+
+enum UserStatus {
+  PENDING_VERIFICATION
+  ACTIVE
+  SUSPENDED
+  DEACTIVATED
+}
+
+/// How a principal proves who they are.
+///
+/// The two populations are genuinely different: customers arrive through
+/// WhatsApp, are identified by phone number, and authenticate with a short PIN;
+/// staff sit in a browser and authenticate with email + password (+ TOTP).
+enum UserType {
+  /// End user reached over WhatsApp. Identity = phone number, credential = PIN.
+  CUSTOMER
+  /// Back-office operator. Identity = email, credential = password.
+  ADMIN
+}
+
+/// A human principal — customer or administrator.
+///
+/// ## One table, two authentication schemes
+///
+/// Customers and admins share this table (single-table inheritance, discriminated
+/// by `type`) because they share everything downstream: sessions, audit trails,
+/// tenancy, soft deletes and RBAC. Splitting them would duplicate all of that and
+/// force every join to know which table to look in.
+///
+/// The cost is that credential columns are nullable and their applicability
+/// depends on `type`. Prisma cannot express "PIN required when type = CUSTOMER",
+/// so that invariant is enforced twice: in `AuthService` at write time, and by a
+/// database CHECK constraint added in the migration — because an invariant only
+/// the application enforces is an invariant a background script will violate.
+///
+/// ## Tenant scoping of identity
+///
+/// Every uniqueness key leads with `tenantId`, so the same person can hold
+/// accounts at two businesses without either tenant being able to enumerate or
+/// disable the other's. A globally unique phone/email would leak existence across
+/// tenants at the login endpoint.
+model User {
+  id       String   @id @default(uuid(7)) @db.Uuid
+  tenantId String   @db.Uuid
+  type     UserType @default(CUSTOMER)
+
+  // -- Identity ---------------------------------------------------------------
+
+  /// E.164, digits only with leading `+` (`+2348012345678`). Normalised at the
+  /// service boundary so `08012345678`, `2348012345678` and `+234 801 234 5678`
+  /// converge on one row instead of creating three accounts and three wallets.
+  /// Required for CUSTOMER; unused for ADMIN.
+  phoneE164       String?   @db.VarChar(20)
+  phoneVerifiedAt DateTime?
+
+  /// Always stored lowercase — normalisation happens in the service layer so the
+  /// unique index is meaningful without relying on the citext extension.
+  /// Required for ADMIN; optional for CUSTOMER (collected, not depended upon).
+  email           String?   @db.VarChar(320)
+  emailVerifiedAt DateTime?
+
+  /// Tenant-unique handle. Lowercase; reserved words rejected at the service layer.
+  username          String?   @db.VarChar(32)
+  /// Last self-service username change. Handles are how people pay each other,
+  /// so they may only change once per cooldown window (see ProfileService).
+  usernameChangedAt DateTime?
+
+  /// The whole name as one string — what a partner bank matches an account
+  /// against, and what appears on receipts. Kept alongside the split fields
+  /// below rather than derived on read, because it is what other systems see and
+  /// it must not change shape when a middle name arrives later.
+  fullName  String? @db.VarChar(160)
+  avatarUrl String? @db.VarChar(2048)
+  locale    String  @default("en") @db.VarChar(16)
+  timezone  String? @db.VarChar(64)
+
+  // -- Personal details -------------------------------------------------------
+  //
+  // Populated automatically when a customer clears KYC tier 1: these are the
+  // *registry's* own split of the name, not a guess at splitting `fullName`,
+  // which is not reliably splittable for Nigerian names. Writable by hand for
+  // customers who are not verified, and overwritten by verification when they
+  // are — the registry wins over self-reported data.
+
+  firstName   String?   @db.VarChar(80)
+  middleName  String?   @db.VarChar(80)
+  lastName    String?   @db.VarChar(80)
+  /// `MALE` / `FEMALE`, as the registry states it.
+  gender      String?   @db.VarChar(16)
+  dateOfBirth DateTime? @db.Date
+  /// Residential address. **Not** filled by KYC: neither the BVN nor the NIN
+  /// enhanced response carries an address, so this is collected from the
+  /// customer or entered by an operator during a tier-3 review.
+  address     String?   @db.VarChar(255)
+
+  // -- Credentials ------------------------------------------------------------
+
+  /// Argon2id digest of the transaction/login PIN (CUSTOMER).
+  /// A 4–6 digit PIN has a 10^4–10^6 keyspace, so the hash is *not* the primary
+  /// defence — `failedPinAttempts` + `lockedUntil` + per-phone rate limiting are.
+  pinHash          String?   @db.VarChar(255)
+  pinSetAt         DateTime?
+  /// Forces a PIN change on next use (support reset, suspected compromise).
+  pinResetRequired Boolean   @default(false)
+
+  /// Argon2id digest (ADMIN). Nullable: SSO-only admins never set a password.
+  passwordHash      String?   @db.VarChar(255)
+  passwordChangedAt DateTime?
+
+  status UserStatus @default(PENDING_VERIFICATION)
+
+  /// TOTP secret, AES-256-GCM encrypted at rest by the crypto service.
+  twoFactorSecret        String?   @db.VarChar(512)
+  twoFactorEnabledAt     DateTime?
+  /// Hashed single-use recovery codes.
+  twoFactorRecoveryCodes String[]  @default([])
+
+  // -- Brute-force controls ---------------------------------------------------
+  // Checked *before* any hash comparison, so a locked account costs no CPU.
+
+  failedLoginAttempts Int       @default(0)
+  failedPinAttempts   Int       @default(0)
+  lockedUntil         DateTime?
+  lastLoginAt         DateTime?
+  lastLoginIp         String?   @db.VarChar(45)
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+  version   Int       @default(0)
+
+  tenant      Tenant              @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  memberships Membership[]
+  sessions    Session[]
+  apiKeys     ApiKey[]
+  teamMembers TeamMember[]
+  auditLogs   AuditLog[]
+  tokens      VerificationToken[]
+  wallet      Wallet?
+  bankAccount BankAccount?
+  payouts     Payout[]
+
+  kycProfile         KycProfile?
+  kycVerifications   KycVerification[]
+  kycIdentityRecords KycIdentityRecord[]
+  onrampAccounts     OnrampVirtualAccount[]
+
+  avatar        UserAvatar?
+  rewardProfile RewardProfile?
+  rewardEntries RewardLedgerEntry[]
+  referralsMade Referral[]          @relation("ReferralReferrer")
+  referredBy    Referral?           @relation("ReferralReferee")
+
+  /// The customer login lookup: `WHERE tenant_id = ? AND phone_e164 = ?`.
+  /// Postgres treats NULLs as distinct, so admins (phone NULL) do not collide.
+  @@unique([tenantId, phoneE164])
+  /// The admin login lookup.
+  @@unique([tenantId, email])
+  @@unique([tenantId, username])
+  @@index([tenantId, type, status])
+  @@index([tenantId, deletedAt])
+  @@map("users")
+}
+
+/// Join between a user and a tenant, carrying the role assignment.
+///
+/// Separate from `User` so a future "invite an existing user into another tenant"
+/// flow needs no data migration, and so role changes are auditable in isolation.
+model Membership {
+  id       String @id @default(uuid(7)) @db.Uuid
+  tenantId String @db.Uuid
+  userId   String @db.Uuid
+  roleId   String @db.Uuid
+
+  /// Permission slugs granted on top of the role, for one-off exceptions.
+  extraPermissions  String[] @default([])
+  /// Permission slugs revoked from the role. Denials always win.
+  deniedPermissions String[] @default([])
+
+  isOwner   Boolean  @default(false)
+  invitedBy String?  @db.Uuid
+  joinedAt  DateTime @default(now())
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role   Role   @relation(fields: [roleId], references: [id], onDelete: Restrict)
+
+  @@unique([tenantId, userId])
+  @@index([tenantId, roleId])
+  @@index([userId])
+  @@map("memberships")
+}
+
+// =============================================================================
+//  AUTHORIZATION
+// =============================================================================
+
+/// A named permission bundle.
+///
+/// Permissions themselves are a compile-time enum in `core/authorization`, not
+/// rows: they change only when code changes, and a static catalogue lets TypeScript
+/// catch a typo in `@RequirePermissions('contacts:writ')` at build time. The DB
+/// stores which slugs a role grants.
+model Role {
+  id       String @id @default(uuid(7)) @db.Uuid
+  tenantId String @db.Uuid
+
+  key         String  @db.VarChar(64)
+  name        String  @db.VarChar(100)
+  description String? @db.VarChar(512)
+
+  /// Seeded roles (owner, admin, agent) cannot be edited or deleted by tenants.
+  isSystem  Boolean @default(false)
+  /// Assigned to new members when no role is specified.
+  isDefault Boolean @default(false)
+
+  permissions String[] @default([])
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+  version   Int       @default(0)
+
+  tenant      Tenant       @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  memberships Membership[]
+  invitations Invitation[]
+
+  @@unique([tenantId, key])
+  @@index([tenantId])
+  @@map("roles")
+}
+
+/// A group of agents used for conversation routing and assignment.
+model Team {
+  id       String @id @default(uuid(7)) @db.Uuid
+  tenantId String @db.Uuid
+
+  name        String  @db.VarChar(100)
+  description String? @db.VarChar(512)
+  /// Hex colour for the UI.
+  color       String? @db.VarChar(9)
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  tenant  Tenant       @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  members TeamMember[]
+
+  @@unique([tenantId, name])
+  @@index([tenantId, deletedAt])
+  @@map("teams")
+}
+
+model TeamMember {
+  id       String @id @default(uuid(7)) @db.Uuid
+  tenantId String @db.Uuid
+  teamId   String @db.Uuid
+  userId   String @db.Uuid
+
+  isLead    Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  team Team @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([teamId, userId])
+  @@index([tenantId, userId])
+  @@map("team_members")
+}
+
+// =============================================================================
+//  SESSIONS, DEVICES, TOKENS
+// =============================================================================
+
+/// A refresh-token family bound to one device.
+///
+/// Rotation model: each refresh mints a new token and marks the previous one used.
+/// Presenting an already-used token means the token was stolen and replayed, so the
+/// entire family is revoked (`REUSE_DETECTED`) — the standard OAuth 2.1 defence.
+model Session {
+  id       String @id @default(uuid(7)) @db.Uuid
+  tenantId String @db.Uuid
+  userId   String @db.Uuid
+
+  /// SHA-256 of the refresh token. The raw token is never stored, so a database
+  /// dump cannot be replayed against the auth endpoint.
+  refreshTokenHash String    @unique @db.VarChar(64)
+  /// Groups every rotation of one login. Revoked as a unit on reuse detection.
+  familyId         String    @db.Uuid
+  /// Set when this token is rotated; presenting a rotated token trips reuse detection.
+  rotatedAt        DateTime?
+
+  deviceId   String? @db.VarChar(128)
+  deviceName String? @db.VarChar(255)
+  deviceType String? @db.VarChar(32)
+  userAgent  String? @db.VarChar(512)
+  ip         String? @db.VarChar(45)
+
+  expiresAt     DateTime
+  lastUsedAt    DateTime  @default(now())
+  revokedAt     DateTime?
+  revokedReason String?   @db.VarChar(128)
+
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, revokedAt])
+  @@index([familyId])
+  /// Drives the cleanup job that prunes expired sessions.
+  @@index([expiresAt])
+  @@index([tenantId, userId])
+  @@map("sessions")
+}
+
+enum VerificationTokenType {
+  EMAIL_VERIFICATION
+  PASSWORD_RESET
+  EMAIL_CHANGE
+  TWO_FACTOR_CHALLENGE
+}
+
+/// Single-use, short-lived tokens. Stored hashed for the same reason as sessions.
+model VerificationToken {
+  id       String @id @default(uuid(7)) @db.Uuid
+  tenantId String @db.Uuid
+  userId   String @db.Uuid
+
+  type      VerificationTokenType
+  tokenHash String                @unique @db.VarChar(64)
+  /// Extra payload, e.g. the requested new email address.
+  metadata  Json?
+
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, type])
+  @@index([expiresAt])
+  @@map("verification_tokens")
+}
+
+/// Machine credentials for server-to-server access.
+model ApiKey {
+  id       String @id @default(uuid(7)) @db.Uuid
+  tenantId String @db.Uuid
+
+  name       String @db.VarChar(100)
+  /// Non-secret public half, shown in the UI and used to look the key up in O(1)
+  /// before the expensive hash comparison: `wba_live_a1b2c3d4`.
+  prefix     String @unique @db.VarChar(32)
+  /// Argon2id digest of the secret half. The full key is shown exactly once.
+  secretHash String @db.VarChar(255)
+
+  /// Permission slugs. An API key can never exceed the permissions of the
+  /// membership that created it.
+  permissions String[] @default([])
+  /// Optional CIDR allowlist enforced before authentication succeeds.
+  allowedIps  String[] @default([])
+
+  createdById String? @db.Uuid
+
+  lastUsedAt    DateTime?
+  expiresAt     DateTime?
+  revokedAt     DateTime?
+  revokedReason String?   @db.VarChar(128)
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  tenant    Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  createdBy User?  @relation(fields: [createdById], references: [id], onDelete: SetNull)
+
+  @@index([tenantId, revokedAt])
+  @@map("api_keys")
+}
+
+enum InvitationStatus {
+  PENDING
+  ACCEPTED
+  REVOKED
+  EXPIRED
+}
+
+model Invitation {
+  id       String @id @default(uuid(7)) @db.Uuid
+  tenantId String @db.Uuid
+
+  email     String           @db.VarChar(320)
+  roleId    String           @db.Uuid
+  tokenHash String           @unique @db.VarChar(64)
+  status    InvitationStatus @default(PENDING)
+
+  invitedById String?   @db.Uuid
+  expiresAt   DateTime
+  acceptedAt  DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  role   Role   @relation(fields: [roleId], references: [id], onDelete: Restrict)
+
+  @@index([tenantId, status])
+  @@index([email])
+  @@map("invitations")
+}
+
+// =============================================================================
+//  AUDIT
+// =============================================================================
+
+/// Append-only record of every state change that matters.
+///
+/// Write-heavy and never updated. In production this table is declaratively
+/// partitioned by month (see the partition_audit_logs migration): retention
+/// becomes `DROP PARTITION` instead of a multi-hour `DELETE`.
+model AuditLog {
+  id       String @id @default(uuid(7)) @db.Uuid
+  tenantId String @db.Uuid
+
+  /// Dot-namespaced, e.g. `contact.deleted`, `apikey.created`.
+  action       String  @db.VarChar(100)
+  resourceType String  @db.VarChar(64)
+  resourceId   String? @db.VarChar(128)
+
+  actorType  String  @db.VarChar(32)
+  actorId    String? @db.Uuid
+  actorEmail String? @db.VarChar(320)
+
+  /// Field-level before/after. Secrets are stripped before write.
+  changes  Json?
+  metadata Json?
+
+  ip        String? @db.VarChar(45)
+  userAgent String? @db.VarChar(512)
+  requestId String? @db.VarChar(128)
+
+  createdAt DateTime @default(now())
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  actor  User?  @relation(fields: [actorId], references: [id], onDelete: SetNull)
+
+  /// The audit UI always filters by tenant and orders by time.
+  @@index([tenantId, createdAt(sort: Desc)])
+  @@index([tenantId, resourceType, resourceId])
+  @@index([tenantId, actorId, createdAt(sort: Desc)])
+  @@map("audit_logs")
+}
+
+// =============================================================================
+//  WALLETS & FUNDING
+//
+//  MONEY REPRESENTATION — the single most consequential decision in this file.
+//
+//  All amounts are BigInt **kobo** (NGN minor units). ₦1,500.50 is 150050.
+//
+//  Never Float/Double: 0.1 + 0.2 !== 0.3 in IEEE-754, and those fractions of a
+//  kobo compound across millions of ledger rows into a balance that cannot be
+//  reconciled with the bank. Not Decimal either: Prisma surfaces it as a JS
+//  object requiring a library for every operation, and integer kobo is exact,
+//  faster to index, and trivially summable in SQL. BigInt (int8) holds ~92
+//  quadrillion kobo — no practical ceiling.
+//
+//  Serialisation note: JSON has no BigInt. The API layer converts to a string
+//  plus a formatted display value; it never emits a JS number for money.
+// =============================================================================
+
+enum WalletStatus {
+  ACTIVE
+  /// Credits allowed, debits blocked — used during dispute or KYC review.
+  FROZEN
+  /// No movement in either direction.
+  SUSPENDED
+  CLOSED
+}
+
+/// A customer's fiat balance. Exactly one per user.
+///
+/// ## Why `balance` is a column and not a `SUM()` of the ledger
+///
+/// The ledger is the source of truth; this column is a maintained cache of it.
+/// Summing millions of entries on every balance check is not viable, so the
+/// balance is updated in the *same transaction* as the ledger entry that moves
+/// it, and `WalletLedgerEntry.balanceAfter` records the resulting value. A
+/// reconciliation job replays the ledger and alerts on any divergence — which is
+/// the property that makes a cached balance safe rather than a liability.
+///
+/// ## Concurrency
+///
+/// Two simultaneous debits must never both read the same starting balance.
+/// Writers take `SELECT ... FOR UPDATE` on this row inside the transaction
+/// (pessimistic), and `version` gives a second optimistic check. Pessimistic
+/// locking is the right default for money: a lost update here is missing cash,
+/// and the contention is per-user, so the lock is never hot.
+model Wallet {
+  id       String @id @default(uuid(7)) @db.Uuid
+  tenantId String @db.Uuid
+  userId   String @db.Uuid
+
+  /// ISO-4217. Single-currency today; the column exists so multi-currency does
+  /// not require rewriting every ledger row later.
+  currency String @default("NGN") @db.VarChar(3)
+
+  /// Spendable balance, in kobo. Starts at zero.
+  balance       BigInt @default(0)
+  /// Funds reserved by an in-flight transaction (pending debit, hold).
+  /// Spendable = `balance - lockedBalance`; kept separate so a hold never
+  /// destroys the record of what the customer actually owns.
+  lockedBalance BigInt @default(0)
+
+  status WalletStatus @default(ACTIVE)
+
+  /// Running totals, maintained alongside the balance. Cheap analytics that
+  /// avoid aggregating the ledger for the common "lifetime funded" question.
+  totalCredited BigInt @default(0)
+  totalDebited  BigInt @default(0)
+
+  lastTransactionAt DateTime?
+  frozenAt          DateTime?
+  frozenReason      String?   @db.VarChar(255)
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+  /// Optimistic-lock counter. Incremented on every balance mutation.
+  version   Int       @default(0)
+
+  user    User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  entries WalletLedgerEntry[]
+
+  /// One wallet per user, enforced by the database rather than by convention.
+  @@unique([userId])
+  @@index([tenantId, status])
+  @@map("wallets")
+}
+
+enum LedgerDirection {
+  CREDIT
+  DEBIT
+}
+
+enum LedgerEntryType {
+  /// Inbound bank transfer to the customer's dedicated account.
+  TOPUP
+  /// Outbound transfer to a third-party bank account.
+  WITHDRAWAL
+  TRANSFER_IN
+  TRANSFER_OUT
+  /// Purchase of a service (airtime, data, bill payment).
+  PURCHASE
+  REFUND
+  REVERSAL
+  FEE
+  /// Manual correction by an operator. Always carries an actor in `metadata`.
+  ADJUSTMENT
+}
+
+enum LedgerEntryStatus {
+  /// Reserved against `lockedBalance`; not yet applied to `balance`.
+  PENDING
+  /// Applied. Terminal.
+  COMPLETED
+  FAILED
+  /// Undone by a later REVERSAL entry — never by deleting this row.
+  REVERSED
+}
+
+/// Append-only record of every movement of money.
+///
+/// **Never updated except to close out a status, never deleted.** A mistake is
+/// corrected by writing a compensating REVERSAL entry, so the history remains a
+/// complete, auditable narrative. This is the artefact a regulator, a customer
+/// dispute, or a 3am reconciliation actually reads.
+model WalletLedgerEntry {
+  id       String @id @default(uuid(7)) @db.Uuid
+  tenantId String @db.Uuid
+  walletId String @db.Uuid
+  userId   String @db.Uuid
+
+  direction LedgerDirection
+  type      LedgerEntryType
+  status    LedgerEntryStatus @default(COMPLETED)
+
+  /// Always positive, in kobo. Direction carries the sign — a signed amount
+  /// invites a `SUM()` that silently nets credits against debits.
+  amount   BigInt
+  currency String @default("NGN") @db.VarChar(3)
+
+  /// Balance before and after this entry. Makes the ledger self-verifying: any
+  /// row whose `balanceBefore` disagrees with the previous row's `balanceAfter`
+  /// is a detected corruption, without recomputing the whole chain.
+  balanceBefore BigInt
+  balanceAfter  BigInt
+
+  /// **Idempotency key.** Unique per tenant. A webhook delivered twice, or a
+  /// retried request, resolves to the same entry instead of crediting twice —
+  /// the single most important constraint in this schema. Payment providers
+  /// retry aggressively and duplicate delivery is normal, not exceptional.
+  reference String @db.VarChar(128)
+
+  /// Provider-side identifier (Paystack/Flutterwave/Monnify transaction id).
+  providerReference   String? @db.VarChar(128)
+  /// Links the two halves of an internal transfer.
+  counterpartyEntryId String? @db.Uuid
+
+  narration String? @db.VarChar(255)
+  /// Provider payload, actor, source account. Secrets stripped before write.
+  metadata  Json?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  wallet Wallet @relation(fields: [walletId], references: [id], onDelete: Restrict)
+
+  /// The idempotency guarantee. A duplicate credit fails at the database, not in
+  /// application logic that a race can slip past.
+  @@unique([tenantId, reference])
+  /// The customer's statement view: one wallet, newest first.
+  @@index([walletId, createdAt(sort: Desc)])
+  @@index([tenantId, type, createdAt(sort: Desc)])
+  @@index([tenantId, status])
+  @@index([providerReference])
+  @@map("wallet_ledger_entries")
+}
+
+enum BankAccountProvider {
+  PAYSTACK
+  FLUTTERWAVE
+  MONNIFY
+  PAYVESSEL
+  /// Pulse MFB. Issues *sub-accounts of our own* account rather than partner-bank
+  /// NUBANs: every account carries our business prefix and settles into our
+  /// balance with them, so the float is ours to reconcile, not a partner's.
+  PULSEMFB
+  /// Operator-entered account, no provider integration.
+  MANUAL
+}
+
+/// How long a provider-issued NUBAN lives.
+///
+/// The distinction is the provider's, and it is load-bearing rather than
+/// cosmetic. A STATIC account is permanent, belongs to one customer forever, and
+/// requires verified identity (BVN/NIN) before the partner bank will issue it. A
+/// DYNAMIC account is single-use: it expires, and money sent to it after expiry
+/// is *refunded to the sender* rather than credited to us — so a dynamic number
+/// must never be stored and re-advertised as somebody's funding account.
+enum VirtualAccountType {
+  STATIC
+  DYNAMIC
+}
+
+/// The dedicated (virtual) bank account a customer funds their wallet from.
+///
+/// Nigerian payment providers issue a per-customer NUBAN; any transfer into it
+/// triggers a webhook that credits the wallet. The provider's `reference` is what
+/// ties an inbound webhook back to a user, so it is unique and indexed.
+///
+/// One per user today. Modelled as its own table rather than columns on `User`
+/// because the fields are provider-owned, change independently of the profile,
+/// and are read on a completely different path (webhook lookup, not login).
+model BankAccount {
+  id       String @id @default(uuid(7)) @db.Uuid
+  tenantId String @db.Uuid
+  userId   String @db.Uuid
+
+  provider  BankAccountProvider @default(PAYSTACK)
+  /// Provider's identifier for this virtual account — the webhook join key.
+  /// PayVessel calls this the `trackingReference`.
+  reference String              @db.VarChar(128)
+
+  /// Always STATIC here. Single-use DYNAMIC accounts have a different lifecycle
+  /// (they expire, they are not reusable, and they belong to one payment rather
+  /// than one customer) and live in `onramp_virtual_accounts` instead.
+  accountType VirtualAccountType @default(STATIC)
+
+  bankName      String @db.VarChar(120)
+  /// CBN/NIP bank code.
+  bankCode      String @db.VarChar(16)
+  accountName   String @db.VarChar(160)
+  /// NUBAN — 10 digits in Nigeria. Stored as text: it is an identifier, not a
+  /// number, and leading zeros are significant.
+  accountNumber String @db.VarChar(20)
+
+  currency String @default("NGN") @db.VarChar(3)
+
+  /// Providers issue accounts asynchronously; a customer can exist before their
+  /// account does. `isActive` gates whether we advertise it for funding.
+  isActive Boolean @default(true)
+
+  /// Raw provisioning response, retained for support and provider disputes.
+  metadata Json?
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  /// One funding account per user.
+  @@unique([userId])
+  /// Webhook lookup: providers send their reference, we resolve the account.
+  @@unique([provider, reference])
+  /// Inbound transfers sometimes identify only the destination NUBAN.
+  @@index([accountNumber])
+  @@index([tenantId, isActive])
+  @@map("bank_accounts")
+}
+
+/// Lifecycle of a single-use funding account issued for one on-ramp payment.
+enum OnrampAccountStatus {
+  /// Issued and advertised to the payer. Nothing has arrived.
+  AWAITING_PAYMENT
+  /// A credit landed and was matched to this account.
+  PAID
+  /// Downstream delivery (crypto out) completed.
+  FULFILLED
+  /// Past `expiresAt` with no payment. The provider refunds late senders.
+  EXPIRED
+  /// Abandoned by the customer before paying.
+  CANCELLED
+}
+
+/// A single-use NUBAN issued so a customer can pay naira for one on-ramp order.
+///
+/// ## Why this is not a `BankAccount`
+///
+/// `BankAccount` models *the account a customer funds their wallet from*: one
+/// per user, permanent, advertised indefinitely. A dynamic account is the
+/// opposite of all three — it belongs to a payment rather than a person, it
+/// expires, and re-advertising a spent one causes the provider to refund the
+/// payer while our UI claims the money is on its way. Forcing both through one
+/// table would mean the `@@unique([userId])` that protects the funding account
+/// has to be dropped, and the safety it provides applies to neither.
+///
+/// ## Identity
+///
+/// `userId` is nullable and `phoneE164` carries the identity instead, because
+/// the on-ramp is reachable over WhatsApp before a platform `User` row exists.
+/// Whichever is present, `reference` and `accountNumber` are what the webhook
+/// arrives with, so both are indexed.
+model OnrampVirtualAccount {
+  id       String  @id @default(uuid(7)) @db.Uuid
+  tenantId String? @db.Uuid
+  userId   String? @db.Uuid
+
+  /// WhatsApp identity of the payer, E.164. Set when there is no `User` yet.
+  phoneE164 String? @db.VarChar(20)
+
+  provider  BankAccountProvider @default(PAYVESSEL)
+  /// Provider's `trackingReference` — the primary webhook join key.
+  reference String              @db.VarChar(128)
+
+  bankName      String @db.VarChar(120)
+  bankCode      String @db.VarChar(16)
+  accountName   String @db.VarChar(160)
+  accountNumber String @db.VarChar(20)
+  currency      String @default("NGN") @db.VarChar(3)
+
+  /// What we told the customer to send, in kobo. Stored so an underpayment is
+  /// detectable rather than silently fulfilled at the quoted rate.
+  expectedAmountKobo BigInt
+  /// What actually arrived, in kobo. Null until a credit is matched.
+  paidAmountKobo     BigInt?
+
+  status OnrampAccountStatus @default(AWAITING_PAYMENT)
+
+  /// Our on-ramp order this account was issued for (`ZyRampOrder.ref`).
+  orderRef         String? @db.VarChar(64)
+  /// Provider's transaction reference from the credit event.
+  paymentReference String? @db.VarChar(128)
+
+  /// Provider-declared expiry. After this, money sent is refunded to the payer.
+  expiresAt DateTime
+  paidAt    DateTime?
+
+  /// Verbatim provisioning response, retained for support and disputes.
+  metadata Json?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  /// Webhook lookup by the provider's own identifier.
+  @@unique([provider, reference])
+  /// Webhook lookup when the payload identifies only the destination NUBAN.
+  /// Not unique: providers recycle dynamic numbers across expired issuances.
+  @@index([accountNumber, status])
+  @@index([phoneE164, status])
+  @@index([status, expiresAt])
+  @@index([orderRef])
+  @@map("onramp_virtual_accounts")
+}
+
+// =============================================================================
+//  KYC / IDENTITY VERIFICATION
+// =============================================================================
+
+/// How much identity evidence a customer has produced.
+///
+/// Deliberately a ladder rather than a boolean. Nigerian tiering (CBN
+/// three-tier KYC) works this way, partner banks require a verified BVN or NIN
+/// before they will issue a permanent NUBAN, and the product needs to serve
+/// people at every rung — a customer with no BVN can still buy crypto through a
+/// single-use account, they just cannot hold a permanent one.
+enum KycLevel {
+  /// Registered, nothing proven. Phone number only. Single-use on-ramp accounts
+  /// and capped amounts; no permanent bank account.
+  TIER_0
+  /// BVN verified: the customer supplied a BVN, a phone number and a date of
+  /// birth, and both supplied fields matched the record the registry holds
+  /// against that BVN.
+  TIER_1
+  /// NIN verified *and consistent with the BVN*: name, gender and date of birth
+  /// on the NIN record agree with the ones already captured from the BVN. This
+  /// is what "fully KYC'ed" means here, and the gate for a STATIC account.
+  TIER_2
+  /// Tier 2 plus manual review (address, document, liveness).
+  TIER_3
+}
+
+/// Where a customer sits in the review pipeline, independent of their level.
+///
+/// Separate from {@link KycLevel} because the two answer different questions:
+/// the level is *how much is proven*, the status is *can they transact*. A
+/// TIER_2 customer who later hits a watchlist is TIER_2/REJECTED, and collapsing
+/// that into one field loses the evidence.
+enum KycStatus {
+  UNVERIFIED
+  /// Submitted; an upstream check or a human review is outstanding.
+  PENDING
+  VERIFIED
+  /// Failed a check or was rejected by review. Blocks upgrades until cleared.
+  REJECTED
+}
+
+enum KycIdentifierType {
+  BVN
+  NIN
+}
+
+/// Which upstream endpoint was called.
+///
+/// The two are priced and shaped differently: BASIC takes the details the
+/// customer typed and answers "do these match?"; ENHANCED takes only the number
+/// and returns the record itself. ENHANCED is authoritative — it is the one
+/// whose names we are willing to write onto a profile.
+enum KycCheckMode {
+  BASIC
+  ENHANCED
+}
+
+enum KycCheckStatus {
+  PENDING
+  /// Identifier found and the supplied details matched.
+  MATCHED
+  /// Identifier found but the details disagreed.
+  MISMATCH
+  /// Identifier does not exist upstream.
+  NOT_FOUND
+  /// The check could not be completed (provider error, timeout, no balance).
+  FAILED
+}
+
+enum KycProviderName {
+  PAYVESSEL
+  /// Verified out of band by an operator; no provider call was made.
+  MANUAL
+}
+
+/// The verified identity of one customer.
+///
+/// ## What is and is not stored
+///
+/// A BVN is the single most sensitive identifier a Nigerian fintech holds, and
+/// it is *needed* — the partner bank requires it in the account-creation call,
+/// so we cannot hash it and throw the original away. The compromise: the number
+/// is kept AES-256-GCM encrypted (`bvnEncrypted`), a SHA-256 digest
+/// (`bvnHash`) supports duplicate-detection and lookup without decrypting, and
+/// `bvnLast4` supports support conversations and logs. Nothing else — never the
+/// provider's `photo` field, which is a full-face image we have no use for.
+///
+/// One row per user, created lazily on the first submission.
+model KycProfile {
+  id       String @id @default(uuid(7)) @db.Uuid
+  tenantId String @db.Uuid
+  userId   String @db.Uuid
+
+  level  KycLevel  @default(TIER_0)
+  status KycStatus @default(UNVERIFIED)
+
+  // -- Bank Verification Number ------------------------------------------------
+
+  /// AES-256-GCM envelope. Decrypted only to call a provider, never returned.
+  bvnEncrypted  String?   @db.VarChar(512)
+  /// SHA-256 of the digits. Lets one BVN be detected across accounts without
+  /// decrypting anything, which is what catches a single person farming
+  /// referral bonuses from ten phone numbers.
+  bvnHash       String?   @db.VarChar(64)
+  bvnLast4      String?   @db.VarChar(4)
+  bvnVerifiedAt DateTime?
+
+  // -- National Identification Number ------------------------------------------
+
+  ninEncrypted  String?   @db.VarChar(512)
+  ninHash       String?   @db.VarChar(64)
+  ninLast4      String?   @db.VarChar(4)
+  ninVerifiedAt DateTime?
+
+  // -- Review ------------------------------------------------------------------
+
+  submittedAt     DateTime?
+  verifiedAt      DateTime?
+  /// Why a REJECTED profile was rejected. Shown to the customer, so it must be
+  /// safe to display — never a raw provider error.
+  rejectionReason String?   @db.VarChar(512)
+  /// Admin `User.id` for a TIER_3 manual decision.
+  reviewedBy      String?   @db.Uuid
+  reviewedAt      DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user            User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  verifications   KycVerification[]
+  identityRecords KycIdentityRecord[]
+
+  @@unique([userId])
+  /// Duplicate-identity sweep: "who else submitted this BVN?"
+  @@index([tenantId, bvnHash])
+  @@index([tenantId, ninHash])
+  @@index([tenantId, level, status])
+  @@map("kyc_profiles")
+}
+
+/// The identity details a registry holds against one of a customer's identifiers.
+///
+/// ## Why this is its own table
+///
+/// Tier 2 is decided by **comparing two registries against each other**: the
+/// name, gender and date of birth on the NIN record must agree with the ones
+/// already captured from the BVN. That comparison needs both sets side by side
+/// and still distinguishable — flattening them into one set of `verified*`
+/// columns on the profile would mean the second check overwrites the very data
+/// it is supposed to be checked against, and the fraud signal disappears at
+/// exactly the moment it matters.
+///
+/// One row per (profile, source). The BVN row is written at tier 1 and is the
+/// reference thereafter; the NIN row is written at tier 2 and records what was
+/// compared, so a later dispute is answered from stored evidence rather than by
+/// paying for the lookup again.
+///
+/// ## What is deliberately not here
+///
+/// The identifier itself — that lives encrypted on {@link KycProfile}, once —
+/// and the provider's `photo` field, a full-face image dropped at the adapter
+/// boundary before it ever reaches a database call.
+model KycIdentityRecord {
+  id        String @id @default(uuid(7)) @db.Uuid
+  tenantId  String @db.Uuid
+  userId    String @db.Uuid
+  profileId String @db.Uuid
+
+  /// Which registry this snapshot came from.
+  source KycIdentifierType
+
+  /// Last four digits of the identifier it was fetched with. Enough for support.
+  identifierLast4 String? @db.VarChar(4)
+
+  firstName  String? @db.VarChar(80)
+  middleName String? @db.VarChar(80)
+  lastName   String? @db.VarChar(80)
+  /// BVN records carry a separate "name as printed on the card" field. Kept
+  /// because it is occasionally the only spelling a partner bank will accept.
+  nameOnCard String? @db.VarChar(160)
+
+  /// `MALE` / `FEMALE` as returned upstream; not normalised into an enum because
+  /// the registry's vocabulary is theirs to change, not ours.
+  gender      String?   @db.VarChar(16)
+  dateOfBirth DateTime? @db.Date
+
+  /// Registry-held phone numbers. BVN records carry up to two.
+  phoneNumber  String? @db.VarChar(20)
+  phoneNumber2 String? @db.VarChar(20)
+
+  /// How this row scored against the BVN reference, 0–100. Null on the BVN row,
+  /// which is the reference rather than a candidate.
+  nameMatchPercent Int?
+
+  capturedAt DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  user    User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  profile KycProfile @relation(fields: [profileId], references: [id], onDelete: Cascade)
+
+  /// One current snapshot per registry, replaced on re-verification.
+  @@unique([profileId, source])
+  @@index([tenantId, userId])
+  @@map("kyc_identity_records")
+}
+
+/// One upstream identity check, kept forever.
+///
+/// Immutable audit rows rather than columns on the profile, because the profile
+/// records *the conclusion* and this records *how we reached it*. A regulator
+/// asking "on what basis did you open this account" is answered from here, and a
+/// customer disputing a rejection is answered from here. It also makes the
+/// billing side legible: each provider check is charged, and `chargedAmount`
+/// says what for.
+model KycVerification {
+  id        String  @id @default(uuid(7)) @db.Uuid
+  tenantId  String  @db.Uuid
+  userId    String  @db.Uuid
+  profileId String? @db.Uuid
+
+  provider       KycProviderName   @default(PAYVESSEL)
+  identifierType KycIdentifierType
+  mode           KycCheckMode
+  status         KycCheckStatus    @default(PENDING)
+
+  /// Last four digits of the identifier checked. The full value is never written
+  /// to this table — it lives encrypted on the profile, once.
+  identifierLast4 String? @db.VarChar(4)
+
+  /// Provider's name-similarity score, 0–100, on a BASIC check.
+  nameMatchPercent Int?
+  /// Field-by-field match results from a BASIC check, verbatim.
+  matchResult      Json?
+
+  /// Upstream response with the identity fields we keep and nothing else — no
+  /// `photo`, no full identifier. Stored redacted at write time, not on read.
+  response Json?
+
+  /// Provider-facing failure text, truncated. Not shown to customers.
+  error String? @db.VarChar(1024)
+
+  /// Providers bill per lookup — including for a "not found" answer.
+  charged       Boolean @default(false)
+  chargedAmount Decimal @default(0) @db.Decimal(18, 2)
+
+  /// Admin `User.id` when a staff member ran the check on a customer's behalf.
+  requestedBy String? @db.Uuid
+
+  createdAt   DateTime  @default(now())
+  completedAt DateTime?
+
+  user    User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  profile KycProfile? @relation(fields: [profileId], references: [id], onDelete: SetNull)
+
+  @@index([tenantId, userId, createdAt(sort: Desc)])
+  @@index([tenantId, status, createdAt(sort: Desc)])
+  @@index([profileId])
+  @@map("kyc_verifications")
+}
+
+enum PayoutProviderName {
+  FALCONPAY
+  /// Pulse MFB. Configured as the fallback behind FalconPay rather than as a
+  /// primary: transfers debit a float we hold with them, so it drains on use and
+  /// is sized for overflow, not for steady-state volume.
+  PULSEMFB
+  /// Executed by an operator out of band; no provider call was made.
+  MANUAL
+}
+
+/// Lifecycle of an outward transfer.
+///
+/// The states are deliberately not the same as the provider's. FalconPay reports
+/// `processing | completed | failed`; we need two states in front of those to
+/// describe money that has been reserved but not yet handed over, because that
+/// window is where a crash or a timeout leaves funds that belong to nobody.
+enum PayoutStatus {
+  /// Funds reserved against `Wallet.lockedBalance`; nothing sent upstream yet.
+  PENDING
+  /// Provider accepted the instruction (HTTP 202). Awaiting their webhook.
+  PROCESSING
+  /// Provider confirmed the recipient was paid. Hold converted to a debit.
+  COMPLETED
+  /// Provider rejected or timed out. Hold released; the customer keeps the money.
+  FAILED
+  /// We could not determine the outcome and a human must decide. The hold stays.
+  ///
+  /// Reached when the request to the provider fails in a way that does not prove
+  /// the transfer was *not* accepted — a network timeout, most typically. Money
+  /// may or may not have left; releasing the hold on a guess is how a customer
+  /// gets paid twice.
+  REQUIRES_REVIEW
+}
+
+/// An outward transfer to a third-party Nigerian bank account.
+///
+/// ## Why this is a table and not just a ledger entry
+///
+/// A withdrawal is a *conversation* with a provider, not an instant. It has a
+/// recipient the ledger has no column for, an upstream reference that only
+/// exists after acceptance, a status that changes asynchronously, and a failure
+/// mode where the money must come back. The ledger records the movement of
+/// funds; this records the attempt to move them, including the attempts that
+/// never became movements.
+///
+/// ## Idempotency
+///
+/// `reference` is generated by us, sent to FalconPay as their idempotency key,
+/// and echoed back on every webhook. It is unique per tenant, which is what makes
+/// a double-submitted withdrawal form resolve to one transfer rather than two.
+model Payout {
+  id       String @id @default(uuid(7)) @db.Uuid
+  tenantId String @db.Uuid
+  userId   String @db.Uuid
+
+  provider PayoutProviderName @default(FALCONPAY)
+  status   PayoutStatus       @default(PENDING)
+
+  /// Our idempotency key. Sent upstream as `reference`, returned on webhooks,
+  /// and used verbatim as the wallet ledger entry's reference.
+  reference String @db.VarChar(128)
+
+  /// FalconPay's `transaction_reference`. Absent until they accept the transfer;
+  /// this is the value support escalations are keyed on.
+  providerReference String? @db.VarChar(128)
+  /// NIP session id from the webhook — the identifier the recipient's bank knows.
+  sessionId         String? @db.VarChar(64)
+
+  /// Amount in kobo, matching the wallet. FalconPay is sent whole naira; a payout
+  /// whose kobo component is non-zero is rejected before it reaches them.
+  amount   BigInt
+  currency String @default("NGN") @db.VarChar(3)
+
+  /// Recipient, captured at request time. Denormalised on purpose: a saved
+  /// beneficiary that is later edited must not rewrite the history of where
+  /// money was actually sent.
+  bankCode      String @db.VarChar(16)
+  bankName      String @db.VarChar(120)
+  accountNumber String @db.VarChar(20)
+  /// As returned by the provider's name enquiry, never as typed by the customer.
+  accountName   String @db.VarChar(160)
+
+  narration String? @db.VarChar(255)
+
+  /// The PENDING hold, and later the settled debit. One entry across the whole
+  /// lifecycle — a hold that settles is the same movement reaching its end.
+  ledgerEntryId String? @db.Uuid
+
+  /// Provider's message on rejection, for support and for the customer's notice.
+  failureReason String? @db.VarChar(512)
+
+  /// Verbatim request/response and webhook payloads. Secrets stripped.
+  metadata Json?
+
+  requestedAt DateTime  @default(now())
+  /// When the provider accepted it (HTTP 202).
+  submittedAt DateTime?
+  /// When it reached a terminal state.
+  completedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  /// The idempotency guarantee: one transfer per reference, enforced by the
+  /// database rather than by a check that a race can slip past.
+  @@unique([tenantId, reference])
+  /// Webhook lookup — the provider sends their reference, we find the payout.
+  @@index([providerReference])
+  /// The customer's withdrawal history, newest first.
+  @@index([userId, createdAt(sort: Desc)])
+  /// The operator's queue: everything stuck in a non-terminal state.
+  @@index([tenantId, status, createdAt(sort: Desc)])
+  @@map("payouts")
+}
+
+// =============================================================================
+//  WHATSAPP — Meta Cloud API
+// =============================================================================
+
+enum WhatsAppNumberStatus {
+  PENDING
+  CONNECTED
+  DISCONNECTED
+  /// Meta has flagged quality; throughput is being throttled.
+  FLAGGED
+  /// Messaging limits applied or the number is banned.
+  RESTRICTED
+}
+
+/// A business phone number registered on a WhatsApp Business Account.
+///
+/// One tenant may hold several. The access token is the crown jewel here: it can
+/// send messages as the business and read every conversation, so it is stored
+/// AES-256-GCM encrypted and never logged (the redaction list covers it).
+model WhatsAppPhoneNumber {
+  id       String @id @default(uuid(7)) @db.Uuid
+  tenantId String @db.Uuid
+
+  /// Meta's phone number id — the path segment of every send call, and the field
+  /// inbound webhooks identify themselves by. Globally unique at Meta.
+  phoneNumberId String @unique @db.VarChar(64)
+  /// WhatsApp Business Account id that owns this number.
+  wabaId        String @db.VarChar(64)
+
+  /// E.164 as displayed to customers.
+  displayPhoneNumber String  @db.VarChar(20)
+  verifiedName       String? @db.VarChar(160)
+
+  /// System user access token, AES-256-GCM encrypted at rest.
+  accessToken String  @db.VarChar(2048)
+  /// Verify token for Meta's webhook handshake, also encrypted.
+  verifyToken String? @db.VarChar(512)
+
+  status        WhatsAppNumberStatus @default(PENDING)
+  /// Meta's quality signal: GREEN / YELLOW / RED. Drives alerting.
+  qualityRating String?              @db.VarChar(16)
+  /// Messaging tier: 250 / 1K / 10K / 100K / UNLIMITED business-initiated per day.
+  messagingTier String?              @db.VarChar(32)
+
+  /// The number used when a tenant sends without naming one.
+  isDefault Boolean @default(false)
+
+  lastSyncedAt DateTime?
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+  version   Int       @default(0)
+
+  conversations Conversation[]
+  messages      Message[]
+  templates     MessageTemplate[]
+
+  @@index([tenantId, status])
+  @@index([wabaId])
+  @@map("whatsapp_phone_numbers")
+}
+
+enum ConversationStatus {
+  OPEN
+  /// Awaiting a customer reply.
+  PENDING
+  RESOLVED
+  ARCHIVED
+}
+
+/// A thread between one business number and one customer.
+///
+/// ## The service window lives here
+///
+/// Meta permits free-form messages only within **24 hours of the customer's last
+/// message**. Outside that window only an approved template may be sent, and
+/// sending anything else is rejected by the API. `lastInboundAt` is the anchor
+/// for that rule, which is why it is a first-class column rather than something
+/// derived by scanning messages.
+model Conversation {
+  id            String @id @default(uuid(7)) @db.Uuid
+  tenantId      String @db.Uuid
+  phoneNumberId String @db.Uuid
+
+  /// The customer's number, E.164. Normalised on the way in, exactly as for users.
+  contactPhoneE164 String  @db.VarChar(20)
+  /// Profile name from the WhatsApp payload. Customer-controlled — never trusted
+  /// for identity, only displayed.
+  contactName      String? @db.VarChar(160)
+
+  /// Linked platform account, once the number is matched to a registered user.
+  /// Nullable: a stranger can message the business before ever signing up.
+  userId String? @db.Uuid
+
+  status ConversationStatus @default(OPEN)
+
+  /// Anchor for the 24-hour service window. NULL means never messaged us.
+  lastInboundAt      DateTime?
+  lastOutboundAt     DateTime?
+  lastMessageAt      DateTime?
+  /// Denormalised preview for the inbox list, avoiding a join per row.
+  lastMessagePreview String?   @db.VarChar(280)
+
+  unreadCount  Int      @default(0)
+  assignedToId String?  @db.Uuid
+  isPinned     Boolean  @default(false)
+  labels       String[] @default([])
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+  version   Int       @default(0)
+
+  phoneNumber WhatsAppPhoneNumber @relation(fields: [phoneNumberId], references: [id], onDelete: Cascade)
+  messages    Message[]
+
+  /// One thread per (business number, customer) pair. This is what makes inbound
+  /// routing an upsert rather than a search.
+  @@unique([phoneNumberId, contactPhoneE164])
+  /// The inbox query: a tenant's threads, most recently active first.
+  @@index([tenantId, lastMessageAt(sort: Desc)])
+  @@index([tenantId, status, lastMessageAt(sort: Desc)])
+  @@index([tenantId, assignedToId])
+  @@index([userId])
+  @@map("conversations")
+}
+
+enum MessageDirection {
+  INBOUND
+  OUTBOUND
+}
+
+/// Lifecycle of an outbound message, mirroring Meta's status callbacks.
+enum MessageStatus {
+  /// Accepted by us, not yet handed to Meta.
+  PENDING
+  /// Meta accepted it and returned a wamid.
+  SENT
+  DELIVERED
+  READ
+  FAILED
+}
+
+enum MessageType {
+  TEXT
+  IMAGE
+  VIDEO
+  AUDIO
+  DOCUMENT
+  STICKER
+  LOCATION
+  CONTACTS
+  INTERACTIVE
+  BUTTON
+  TEMPLATE
+  REACTION
+  ORDER
+  SYSTEM
+  /// A type Meta added that this version does not model. Stored verbatim.
+  UNSUPPORTED
+}
+
+/// One WhatsApp message, inbound or outbound.
+///
+/// The highest-volume table in the platform. Every index here is deliberate and
+/// every column is one a query actually filters or displays on.
+model Message {
+  id             String @id @default(uuid(7)) @db.Uuid
+  tenantId       String @db.Uuid
+  conversationId String @db.Uuid
+  phoneNumberId  String @db.Uuid
+
+  /// Meta's message id (`wamid.HBg...`).
+  ///
+  /// **The idempotency key for inbound processing.** Meta redelivers webhooks on
+  /// any non-2xx and duplicates are routine, so this is unique per tenant and a
+  /// redelivery collides instead of creating a second message.
+  wamid String? @db.VarChar(128)
+
+  direction MessageDirection
+  type      MessageType
+  status    MessageStatus    @default(PENDING)
+
+  /// Plain-text body or caption, extracted for search and inbox previews.
+  text    String? @db.Text
+  /// The full, verbatim message content. Media ids, interactive payloads and
+  /// anything this schema does not model explicitly survive here.
+  payload Json?
+
+  /// Template used, for outbound template sends.
+  templateName String? @db.VarChar(128)
+  /// wamid this replies to, for threaded quotes.
+  replyToWamid String? @db.VarChar(128)
+
+  /// Meta's numeric error code and description on failure. Kept because their
+  /// codes are the only reliable way to distinguish "retry" from "never retry".
+  errorCode  Int?
+  errorTitle String? @db.VarChar(512)
+
+  /// Client-supplied idempotency key for outbound sends, so a retried API call
+  /// does not send the customer a second message.
+  clientReference String? @db.VarChar(128)
+
+  sentAt      DateTime?
+  deliveredAt DateTime?
+  readAt      DateTime?
+  failedAt    DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  conversation Conversation        @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  phoneNumber  WhatsAppPhoneNumber @relation(fields: [phoneNumberId], references: [id], onDelete: Cascade)
+
+  /// Inbound idempotency. Meta redelivers; this makes that harmless.
+  @@unique([tenantId, wamid])
+  /// Outbound idempotency for client retries.
+  @@unique([tenantId, clientReference])
+  /// The thread view: one conversation, newest first.
+  @@index([conversationId, createdAt(sort: Desc)])
+  @@index([tenantId, status, createdAt(sort: Desc)])
+  @@index([tenantId, direction, createdAt(sort: Desc)])
+  @@map("messages")
+}
+
+enum TemplateStatus {
+  DRAFT
+  PENDING
+  APPROVED
+  REJECTED
+  PAUSED
+  DISABLED
+}
+
+/// A message template registered with Meta.
+///
+/// Templates are the *only* way to reach a customer outside the 24-hour service
+/// window, so their approval state is operationally critical: sending an
+/// unapproved template fails at Meta and the customer never hears from us.
+model MessageTemplate {
+  id            String @id @default(uuid(7)) @db.Uuid
+  tenantId      String @db.Uuid
+  phoneNumberId String @db.Uuid
+
+  name     String @db.VarChar(128)
+  language String @db.VarChar(16)
+  /// Meta's category: MARKETING / UTILITY / AUTHENTICATION. Drives pricing.
+  category String @db.VarChar(32)
+
+  status         TemplateStatus @default(DRAFT)
+  metaTemplateId String?        @db.VarChar(64)
+  rejectedReason String?        @db.VarChar(512)
+
+  /// Header/body/footer/buttons, in Meta's component format.
+  components        Json
+  /// Count of `{{n}}` placeholders in the body, so a send can be validated
+  /// against the template before it is handed to Meta.
+  bodyVariableCount Int  @default(0)
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  phoneNumber WhatsAppPhoneNumber @relation(fields: [phoneNumberId], references: [id], onDelete: Cascade)
+
+  /// Meta's own uniqueness rule: one template per (name, language) per account.
+  @@unique([phoneNumberId, name, language])
+  @@index([tenantId, status])
+  @@map("message_templates")
+}
+
+// =============================================================================
+//  INBOUND WEBHOOKS
+// =============================================================================
+
+enum WebhookEventStatus {
+  RECEIVED
+  PROCESSED
+  /// Recognised but intentionally not acted upon (event type we do not handle).
+  IGNORED
+  FAILED
+}
+
+/// Every webhook we accept, stored before it is acted upon.
+///
+/// ## Why persist the raw event at all
+///
+/// Three reasons, each learned the hard way in payments:
+///  1. **Idempotency.** Providers retry on any non-2xx, on timeouts, and
+///     sometimes for no reason at all. `(provider, providerEventId)` is unique,
+///     so a redelivery is recognised instead of re-credited.
+///  2. **Replay.** When a bug drops an event, the fix is to reprocess the stored
+///     payload — impossible if the only record was a log line that has rotated.
+///  3. **Dispute evidence.** "We never received that transfer" is answered by the
+///     exact bytes the provider sent, with their signature.
+///
+/// `tenantId` is nullable because a webhook arrives with no tenant context: the
+/// owner is discovered by resolving the destination account, which can fail (an
+/// event for an account we do not know). Storing it unattributed is still better
+/// than discarding it.
+model WebhookEvent {
+  id       String  @id @default(uuid(7)) @db.Uuid
+  tenantId String? @db.Uuid
+
+  provider        String  @db.VarChar(32)
+  eventType       String  @db.VarChar(64)
+  /// The provider's own event identifier — the deduplication key.
+  providerEventId String? @db.VarChar(128)
+
+  /// Verbatim payload. Never edited; the record of what they actually sent.
+  payload   Json
+  /// Signature header as received, retained for dispute evidence.
+  signature String? @db.VarChar(512)
+
+  status   WebhookEventStatus @default(RECEIVED)
+  /// Populated on failure. Truncated — never the full stack.
+  error    String?            @db.VarChar(1024)
+  attempts Int                @default(0)
+
+  /// Ledger entry produced by this event, when it moved money.
+  ledgerEntryId String? @db.Uuid
+
+  receivedAt  DateTime  @default(now())
+  processedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  /// The idempotency guarantee for redelivery.
+  @@unique([provider, providerEventId])
+  @@index([tenantId, status])
+  @@index([status, receivedAt])
+  @@index([eventType, receivedAt(sort: Desc)])
+  @@map("webhook_events")
+}
+
+/// Server-side record of an idempotent request.
+///
+/// Guarantees that a retried `POST /messages` (client timeout, proxy retry,
+/// mobile network hiccup) sends one WhatsApp message, not two. The unique
+/// constraint on `(tenantId, key, endpoint)` is what makes the check atomic under
+/// concurrency — two racing requests cannot both insert.
+model IdempotencyRecord {
+  id       String @id @default(uuid(7)) @db.Uuid
+  tenantId String @db.Uuid
+
+  key         String @db.VarChar(255)
+  endpoint    String @db.VarChar(255)
+  /// SHA-256 of the request body: replaying a key with a *different* payload is a
+  /// client bug and must fail loudly rather than return the wrong cached response.
+  requestHash String @db.VarChar(64)
+
+  status       String @default("in_progress") @db.VarChar(24)
+  responseCode Int?
+  responseBody Json?
+
+  lockedAt  DateTime @default(now())
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([tenantId, key, endpoint])
+  @@index([expiresAt])
+  @@map("idempotency_records")
+}
+
+// =============================================================================
+//  ZYLO RAMP — WhatsApp USDC ↔ NGN (platform-level, not tenant-scoped)
+// =============================================================================
+
+model ZyRampUser {
+  id               Int       @id @default(autoincrement())
+  phone            String    @unique @db.VarChar(32)
+  wallet           String?   @db.VarChar(64)
+  stellarWallet    String?   @map("stellar_wallet") @db.VarChar(64)
+  /// Active custodial Stellar address — classic G… (post-migration). May briefly be C… until migrated.
+  zyloWallet       String?   @map("zylo_wallet") @db.VarChar(72)
+  /// Former Soroban smart wallet (C…) after migrate to G….
+  zyloWalletLegacy String?   @map("zylo_wallet_legacy") @db.VarChar(72)
+  /// HD-derived custodial Celo EOA (0x...). Holds USDC/USDT/cUSD. Optional.
+  celoWallet       String?   @unique @map("celo_wallet") @db.VarChar(42)
+  bankName         String?   @map("bank_name") @db.VarChar(64)
+  bankAccount      String?   @map("bank_account") @db.VarChar(32)
+  accountName      String?   @map("account_name") @db.VarChar(128)
+  username         String?   @unique @db.VarChar(64)
+  email            String?   @db.VarChar(160)
+  pinHash          String?   @map("pin_hash") @db.VarChar(100)
+  pinSetupHash     String?   @map("pin_setup_hash") @db.VarChar(100)
+  onboardingStep   String?   @map("onboarding_step") @db.VarChar(32)
+  onboardedAt      DateTime? @map("onboarded_at")
+  whatsappName     String?   @map("whatsapp_name") @db.VarChar(128)
+  createdAt        DateTime  @default(now()) @map("created_at")
+  updatedAt        DateTime  @updatedAt @map("updated_at")
+
+  @@map("zylo_ramp_users")
+}
+
+/// Saved NGN payout destinations for Sell USDC (default used on next sell).
+model ZyRampPayoutAccount {
+  id            Int      @id @default(autoincrement())
+  phone         String   @db.VarChar(32)
+  bankName      String   @map("bank_name") @db.VarChar(128)
+  bankCode      String   @map("bank_code") @db.VarChar(16)
+  accountNumber String   @map("account_number") @db.VarChar(16)
+  accountName   String   @map("account_name") @db.VarChar(160)
+  isDefault     Boolean  @default(false) @map("is_default")
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  @@unique([phone, bankCode, accountNumber])
+  @@index([phone, isDefault])
+  @@map("zylo_ramp_payout_accounts")
+}
+
+/// Saved transfer nicknames (Xara-style beneficiaries): send 1 usdc to mum
+model ZyRampContact {
+  id        Int      @id @default(autoincrement())
+  phone     String   @db.VarChar(32)
+  alias     String   @db.VarChar(40)
+  address   String   @db.VarChar(72)
+  label     String?  @db.VarChar(80)
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@unique([phone, alias])
+  @@index([phone])
+  @@map("zylo_ramp_contacts")
+}
+
+model ZyRampOrder {
+  id                Int       @id @default(autoincrement())
+  ref               String    @unique @db.VarChar(32)
+  type              String    @db.VarChar(8)
+  phone             String    @db.VarChar(32)
+  amountUsdc        Decimal   @map("amount_usdc") @db.Decimal(18, 6)
+  amountNgn         Int       @map("amount_ngn")
+  rate              Int
+  status            String    @db.VarChar(32)
+  depositAddress    String?   @map("deposit_address") @db.VarChar(64)
+  wallet            String?   @db.VarChar(64)
+  chain             String    @default("celo") @db.VarChar(16)
+  payoutBankName    String?   @map("payout_bank_name") @db.VarChar(64)
+  payoutBankAccount String?   @map("payout_bank_account") @db.VarChar(32)
+  payoutAccountName String?   @map("payout_account_name") @db.VarChar(128)
+  txHash            String?   @map("tx_hash") @db.VarChar(66)
+  expiresAt         DateTime? @map("expires_at")
+  createdAt         DateTime  @default(now()) @map("created_at")
+  updatedAt         DateTime  @updatedAt @map("updated_at")
+
+  @@index([phone])
+  @@index([status])
+  @@map("zylo_ramp_orders")
+}
+
+/// WhatsApp → Nigerian bank send (USDC wallet → FalconPay NGN payout).
+model ZyRampBankSend {
+  id                Int       @id @default(autoincrement())
+  /// Our payout / FalconPay reference (idempotency key).
+  ref               String    @unique @db.VarChar(64)
+  phone             String    @db.VarChar(32)
+  amountNgn         Int       @map("amount_ngn")
+  amountUsdc        Decimal   @map("amount_usdc") @db.Decimal(18, 6)
+  rate              Int
+  bankCode          String    @map("bank_code") @db.VarChar(16)
+  bankName          String    @map("bank_name") @db.VarChar(120)
+  accountNumber     String    @map("account_number") @db.VarChar(20)
+  accountName       String    @map("account_name") @db.VarChar(160)
+  status            String    @db.VarChar(32)
+  /// Platform User id used for ledger hold / FalconPay payout (when linked).
+  platformUserId    String?   @map("platform_user_id") @db.Uuid
+  /// stellar | celo — which crypto float funded this payout.
+  chain             String    @default("stellar") @db.VarChar(16)
+  stellarTxHash     String?   @map("stellar_tx_hash") @db.VarChar(128)
+  celoTxHash        String?   @map("celo_tx_hash") @db.VarChar(66)
+  providerReference String?   @map("provider_reference") @db.VarChar(128)
+  failureReason     String?   @map("failure_reason") @db.VarChar(512)
+  createdAt         DateTime  @default(now()) @map("created_at")
+  updatedAt         DateTime  @updatedAt @map("updated_at")
+  completedAt       DateTime? @map("completed_at")
+
+  @@index([phone])
+  @@index([status])
+  @@map("zylo_ramp_bank_sends")
+}
+
+/// WhatsApp bill payment (airtime, data, electricity, cable TV, betting).
+/// Crypto is debited to the vault; this row is the admin audit / volume source.
+model ZyRampBillPurchase {
+  id                Int      @id @default(autoincrement())
+  ref               String   @unique @db.VarChar(64)
+  phone             String   @db.VarChar(32)
+  /// airtime | data | electricity | cable | betting
+  vertical          String   @db.VarChar(32)
+  amountNgn         Int      @map("amount_ngn")
+  amountUsdc        Decimal  @map("amount_usdc") @db.Decimal(18, 6)
+  rate              Int
+  /// Product label: network, DISCO, TV provider, betting company, etc.
+  productLabel      String?  @map("product_label") @db.VarChar(160)
+  /// Meter / smartcard / MSISDN / betting customer id.
+  customerId        String?  @map("customer_id") @db.VarChar(64)
+  customerName      String?  @map("customer_name") @db.VarChar(160)
+  status            String   @db.VarChar(32)
+  chain             String   @default("stellar") @db.VarChar(16)
+  stellarTxHash     String?  @map("stellar_tx_hash") @db.VarChar(128)
+  celoTxHash        String?  @map("celo_tx_hash") @db.VarChar(66)
+  providerReference String?  @map("provider_reference") @db.VarChar(128)
+  failureReason     String?  @map("failure_reason") @db.VarChar(512)
+  createdAt         DateTime @default(now()) @map("created_at")
+  updatedAt         DateTime @updatedAt @map("updated_at")
+
+  @@index([phone])
+  @@index([vertical])
+  @@index([status])
+  @@index([createdAt])
+  @@map("zylo_ramp_bill_purchases")
+}
+
+/// Singleton ops config for WhatsApp ramp rates / limits (admin dashboard editable).
+model ZyRampSettings {
+  id              Int      @id @default(1)
+  /// NGN per 1 USDC when user sells crypto → Naira.
+  sellRateNgn     Int      @map("sell_rate_ngn")
+  /// NGN per 1 USDC when user buys crypto → pays Naira.
+  buyRateNgn      Int      @map("buy_rate_ngn")
+  maxOrderUsdc    Decimal  @map("max_order_usdc") @db.Decimal(18, 6)
+  minBankSendNgn  Int      @map("min_bank_send_ngn")
+  maxBankSendNgn  Int      @map("max_bank_send_ngn")
+  sellFeeNgn      Int      @default(0) @map("sell_fee_ngn")
+  updatedByUserId String?  @map("updated_by_user_id") @db.Uuid
+  updatedAt       DateTime @updatedAt @map("updated_at")
+  createdAt       DateTime @default(now()) @map("created_at")
+
+  @@map("zylo_ramp_settings")
+}
+
+/// Lifetime volume counters for USDC/XLM that moves through Zylo (internal only).
+model ZyRampVolumeStats {
+  id            Int      @id @default(1)
+  usdcVolume    Decimal  @default(0) @map("usdc_volume") @db.Decimal(24, 6)
+  xlmVolume     Decimal  @default(0) @map("xlm_volume") @db.Decimal(24, 6)
+  usdcTransfers Int      @default(0) @map("usdc_transfers")
+  xlmTransfers  Int      @default(0) @map("xlm_transfers")
+  transferCount Int      @default(0) @map("transfer_count")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  @@map("zylo_ramp_volume_stats")
+}
+
+/// One row per counted movement — unique on dedupeKey so retries / inbound+outbound don’t double-count.
+model ZyRampVolumeEvent {
+  id        Int      @id @default(autoincrement())
+  /// Usually Stellar tx hash; else synthetic e.g. buy:ref / sell:ref.
+  dedupeKey String   @unique @map("dedupe_key") @db.VarChar(160)
+  asset     String   @db.VarChar(8)
+  amount    Decimal  @db.Decimal(24, 6)
+  kind      String   @db.VarChar(32)
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([asset])
+  @@index([kind])
+  @@map("zylo_ramp_volume_events")
+}
+
+// =============================================================================
+//  PROFILE MEDIA
+// =============================================================================
+
+/// A customer's profile photo, re-encoded server-side.
+///
+/// Stored in the database rather than an object store because there is no
+/// object store yet, and the image is small by construction: every upload is
+/// decoded, EXIF-stripped and re-encoded to a 256×256 WebP (~10 KB) before it
+/// is written. Anything that fails to decode is rejected, so this column never
+/// holds arbitrary bytes a browser might sniff into something executable.
+model UserAvatar {
+  userId      String   @id @db.Uuid
+  tenantId    String   @db.Uuid
+  contentType String   @db.VarChar(32)
+  data        Bytes
+  updatedAt   DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@map("user_avatars")
+}
+
+// =============================================================================
+//  BANJEE POINTS & REFERRALS
+// =============================================================================
+
+enum RewardReason {
+  SIGNUP
+  DAILY_CHECK_IN
+  STREAK_BONUS
+  TRANSACTION_MILESTONE
+  REFERRAL_REFERRER
+  REFERRAL_REFEREE
+  /// Operator correction. Negative amounts allowed.
+  ADJUSTMENT
+}
+
+/// Per-customer rewards state: balance, streak and referral code.
+///
+/// `pointsBalance` is a cache of `SUM(reward_ledger_entries.points)`, updated in
+/// the same transaction as every ledger insert, so the two never disagree.
+model RewardProfile {
+  id       String @id @default(uuid(7)) @db.Uuid
+  tenantId String @db.Uuid
+  userId   String @db.Uuid
+
+  /// Shareable code, e.g. `ADA7K2QF`. Uppercase, no ambiguous characters.
+  referralCode String @db.VarChar(16)
+
+  pointsBalance  Int @default(0)
+  lifetimePoints Int @default(0)
+
+  currentStreak   Int       @default(0)
+  longestStreak   Int       @default(0)
+  /// Calendar day (Africa/Lagos) of the last check-in.
+  lastCheckInDate DateTime? @db.Date
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId])
+  @@unique([tenantId, referralCode])
+  @@map("reward_profiles")
+}
+
+/// Append-only points ledger. One row per award.
+///
+/// `dedupeKey` makes every award idempotent: `signup`, `checkin:2026-09-16`,
+/// `milestone:10`, `referral:<refereeId>`. A retry, a double-click or two
+/// concurrent requests collapse onto the unique index instead of paying twice.
+model RewardLedgerEntry {
+  id        String       @id @default(uuid(7)) @db.Uuid
+  tenantId  String       @db.Uuid
+  userId    String       @db.Uuid
+  reason    RewardReason
+  points    Int
+  dedupeKey String       @db.VarChar(96)
+  /// Customer-facing line, e.g. "7-day streak bonus".
+  label     String       @db.VarChar(160)
+  metadata  Json?
+  createdAt DateTime     @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, dedupeKey])
+  @@index([tenantId, userId, createdAt(sort: Desc)])
+  @@map("reward_ledger_entries")
+}
+
+enum ReferralStatus {
+  /// Signed up with a code; has not yet done what qualifies the reward.
+  PENDING
+  /// Qualified and both sides were paid.
+  REWARDED
+  /// Blocked by a fraud rule (same identity, cap reached, ...). Never paid.
+  REJECTED
+}
+
+/// Who invited whom. A customer can be referred at most once, ever.
+model Referral {
+  id              String         @id @default(uuid(7)) @db.Uuid
+  tenantId        String         @db.Uuid
+  referrerId      String         @db.Uuid
+  refereeId       String         @db.Uuid
+  status          ReferralStatus @default(PENDING)
+  /// Customer-safe reason for a REJECTED referral.
+  rejectionReason String?        @db.VarChar(255)
+  /// Signup IP, for the same-device fraud check. Not shown to customers.
+  signupIp        String?        @db.VarChar(45)
+  rewardedAt      DateTime?
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+
+  referrer User @relation("ReferralReferrer", fields: [referrerId], references: [id], onDelete: Cascade)
+  referee  User @relation("ReferralReferee", fields: [refereeId], references: [id], onDelete: Cascade)
+
+  @@unique([refereeId])
+  @@index([tenantId, referrerId, createdAt(sort: Desc)])
+  @@index([tenantId, status])
+  @@map("referrals")
+}
