@@ -3,6 +3,7 @@
 The NestJS service that powers **BANJEE** (product codename: **Zylo**) — a Stellar-first USDC ↔ Naira wallet accessible on web and WhatsApp. This repo is the server of record: it owns custody orchestration, rates, KYC, PIN policy, bills routing, payouts, and the WhatsApp conversational finance bot.
 
 > Live: **https://www.usebanjee.com** · API: `https://zylo-production.up.railway.app/api/v1`
+> **Full product + architecture doc (spans all three repos): [`PRODUCT.md`](PRODUCT.md)**
 > Sister repos: [`Zylo-Finace/frontend`](https://github.com/Zylo-Finace/frontend) · [`Zylo-Finace/contract`](https://github.com/Zylo-Finace/contract)
 
 ---
