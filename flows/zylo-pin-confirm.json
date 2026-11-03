@@ -1,0 +1,61 @@
+{
+  "version": "6.0",
+  "routing_model": {},
+  "screens": [
+    {
+      "id": "PIN",
+      "title": "Confirm send",
+      "terminal": true,
+      "success": true,
+      "data": {
+        "recap": {
+          "type": "string",
+          "__example__": "0.01 USDC → @friend"
+        }
+      },
+      "layout": {
+        "type": "SingleColumnLayout",
+        "children": [
+          {
+            "type": "TextHeading",
+            "text": "Enter your BANJEE PIN"
+          },
+          {
+            "type": "TextBody",
+            "text": "${data.recap}"
+          },
+          {
+            "type": "TextBody",
+            "text": "Your PIN stays in this popup — it is not saved as a chat message."
+          },
+          {
+            "type": "Form",
+            "name": "pin_form",
+            "children": [
+              {
+                "type": "TextInput",
+                "name": "pin",
+                "label": "4-digit PIN",
+                "input-type": "passcode",
+                "required": true,
+                "min-chars": 4,
+                "max-chars": 4,
+                "helper-text": "Never share your PIN"
+              },
+              {
+                "type": "Footer",
+                "label": "Confirm send",
+                "on-click-action": {
+                  "name": "complete",
+                  "payload": {
+                    "pin": "${form.pin}"
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

@@ -1,0 +1,133 @@
+{
+  "version": "6.0",
+  "routing_model": {
+    "ACCOUNT": ["PIN"],
+    "PIN": []
+  },
+  "screens": [
+    {
+      "id": "ACCOUNT",
+      "title": "Create account",
+      "data": {},
+      "layout": {
+        "type": "SingleColumnLayout",
+        "children": [
+          {
+            "type": "TextHeading",
+            "text": "Your BANJEE profile"
+          },
+          {
+            "type": "TextBody",
+            "text": "Pick a username friends can send to, plus your email."
+          },
+          {
+            "type": "Form",
+            "name": "account_form",
+            "children": [
+              {
+                "type": "TextInput",
+                "name": "username",
+                "label": "Username",
+                "input-type": "text",
+                "required": true,
+                "min-chars": 3,
+                "max-chars": 20,
+                "helper-text": "Letters, numbers, underscore — e.g. your_name"
+              },
+              {
+                "type": "TextInput",
+                "name": "email",
+                "label": "Email",
+                "input-type": "email",
+                "required": true,
+                "helper-text": "For receipts and account recovery"
+              },
+              {
+                "type": "Footer",
+                "label": "Next",
+                "on-click-action": {
+                  "name": "navigate",
+                  "next": {
+                    "type": "screen",
+                    "name": "PIN"
+                  },
+                  "payload": {
+                    "username": "${form.username}",
+                    "email": "${form.email}"
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "PIN",
+      "title": "Set PIN",
+      "terminal": true,
+      "success": true,
+      "data": {
+        "username": {
+          "type": "string",
+          "__example__": "your_name"
+        },
+        "email": {
+          "type": "string",
+          "__example__": "you@example.com"
+        }
+      },
+      "layout": {
+        "type": "SingleColumnLayout",
+        "children": [
+          {
+            "type": "TextHeading",
+            "text": "Secure your account"
+          },
+          {
+            "type": "TextBody",
+            "text": "Create a 4-digit PIN. It stays in this popup — not as a chat message."
+          },
+          {
+            "type": "Form",
+            "name": "pin_form",
+            "children": [
+              {
+                "type": "TextInput",
+                "name": "pin",
+                "label": "4-digit PIN",
+                "input-type": "passcode",
+                "required": true,
+                "min-chars": 4,
+                "max-chars": 4,
+                "helper-text": "Don’t reuse a bank PIN"
+              },
+              {
+                "type": "TextInput",
+                "name": "pin_confirm",
+                "label": "Confirm PIN",
+                "input-type": "passcode",
+                "required": true,
+                "min-chars": 4,
+                "max-chars": 4
+              },
+              {
+                "type": "Footer",
+                "label": "Create account",
+                "on-click-action": {
+                  "name": "complete",
+                  "payload": {
+                    "username": "${data.username}",
+                    "email": "${data.email}",
+                    "pin": "${form.pin}",
+                    "pin_confirm": "${form.pin_confirm}"
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}
