@@ -1,89 +1,150 @@
-# WhatsApp Business Platform
+# BANJEE — Backend API + WhatsApp Bot
 
-Multi-tenant WhatsApp Business messaging platform built on the Meta WhatsApp Cloud
-API — the class of product occupied by Interakt, Wati, Respond.io and SleekFlow.
+The NestJS service that powers **BANJEE** (product codename: **Zylo**) — a Stellar-first USDC ↔ Naira wallet accessible on web and WhatsApp. This repo is the server of record: it owns custody orchestration, rates, KYC, PIN policy, bills routing, payouts, and the WhatsApp conversational finance bot.
 
-Built as a **modular monolith** with explicit seams for a later service split.
-Design reasoning, including rejected alternatives, lives in
+> Live: **https://www.usebanjee.com** · API: `https://zylo-production.up.railway.app/api/v1`
+> Sister repos: [`Zylo-Finace/frontend`](https://github.com/Zylo-Finace/frontend) · [`Zylo-Finace/contract`](https://github.com/Zylo-Finace/contract)
 
 ---
 
-## Status
+## What BANJEE does
 
-**Phase 1** — foundation, core kernel, multi-tenancy primitives.
-**Phase 2** — authentication, wallets and funding accounts.
-**Phase 3** — payment provider integration, funding webhooks, money movement.
-**Phase 4** — Meta WhatsApp Cloud API: inbound webhook, sending, conversations.
+BANJEE is a consumer wallet for Nigerian users. One account, one PIN, two channels (web + WhatsApp), one set of limits and rates. Users can:
 
-**Phase 5** _(in progress)_ — RBAC and the admin panel are delivered; number
-onboarding, template sync and the messaging API remain.
-**Phase 6** — contacts and the queue backbone.
+- Receive and spend **USDC on Stellar** using per-user on-chain deposit addresses (classic `G…` accounts today; Soroban `C…` wallets opt-in via the sister `contract` repo).
+- Fund in **Naira** via a dedicated NUBAN virtual account and convert to USDC at a rate locked at review.
+- Sell USDC back to Naira and pay out to any Nigerian bank.
+- Pay bills — airtime, data, electricity, TV — straight from a Naira or USDC balance.
+- Chat with a WhatsApp bot that understands intents like "send 50 usdc to +234…", "sell 20 usdc", "buy 2k data for mtn 0803…", gated by the same PIN as the web app.
 
-Scope and sequencing reasoning is in [Roadmap](#roadmap).
+This backend is the system of record and the brain. The web frontend has no chain, payments-provider, or custody keys — everything flows through here.
 
-| Delivered         |                                                                                         |
-| ----------------- | --------------------------------------------------------------------------------------- |
-| Configuration     | Fail-fast env validation, typed config tree, production guardrails                      |
-| Request context   | `AsyncLocalStorage` propagation of tenant, user, request/correlation id                 |
-| Tenancy           | Prisma extension enforcing isolation on every query; header/subdomain resolution        |
-| Errors            | Stable `ErrorCode` catalogue, single `AppException`, pluggable translators              |
-| Customer auth     | Phone (E.164) + PIN, Argon2id, lockout, weak-PIN rejection, enumeration resistance      |
-| Admin auth        | Email + password, separate credential path and route guard                              |
-| Sessions          | Access/refresh split secrets, rotation, family revocation on reuse detection            |
-| Wallets           | One ₦ wallet per customer, integer kobo, append-only double-entry ledger                |
-| Money movement    | `SELECT … FOR UPDATE` locking, three-layer idempotency, overdraft protection            |
-| Payments          | Provider abstraction + Paystack adapter, virtual account provisioning                   |
-| Webhooks          | HMAC-SHA512 verification over raw bytes, event store, dedupe, replay                    |
-| WhatsApp inbound  | Meta handshake, HMAC-SHA256 over raw bytes, per-item failure isolation, `wamid` dedupe  |
-| WhatsApp outbound | Text and template sends, 24h service window enforced pre-flight, client idempotency     |
-| Conversations     | Thread per (business number, contact), delivery-status tracking, encrypted tokens       |
-| RBAC              | Compile-time permission catalogue, deny-wins resolution, wildcards, escalation guards   |
-| Admin panel       | Dashboard, workspace, members, roles, teams, invitations, API keys, sessions, customers |
-| Audit trail       | Append-only, field-level diffs, key-fragment redaction, non-blocking writes             |
-| Caching           | Redis client, key namespacing, fail-open cache, distributed locks                       |
-| Observability     | Pino structured logs with redaction, Prometheus metrics, OpenTelemetry                  |
-| HTTP              | Response envelope, validation, versioning, timeouts, security headers                   |
-| Health            | Separate liveness / readiness / detail probes                                           |
-| DevOps            | Multi-stage Dockerfile, Compose stack, nginx, GitHub Actions                            |
-| Tests             | 355 unit + 95 e2e, all green                                                            |
+### Where this repo fits
 
-Not yet built: outbound transfers/withdrawals, contacts, campaigns, automation,
-AI, queues and realtime.
+```
+ ┌──────────────┐        ┌────────────────────┐        ┌───────────────────┐
+ │ Web frontend │ ─HTTP► │  Backend API       │ ─SDK─► │ Stellar network   │
+ │              │        │  (this repo)       │        │ classic + Soroban │
+ └──────────────┘        │  + WhatsApp bot    │        └───────────────────┘
+                         │  + NGN rails       │ ─────► FalconPay / PayVessel / PulseMFB
+ ┌──────────────┐        │                    │ ─────► Paystack (legacy)
+ │  WhatsApp    │ ─HTTP► │                    │ ─────► SMEPlug / ClubKonnect (bills)
+ │  (Meta API)  │        │                    │
+ └──────────────┘        └────────────────────┘
+                                    │
+                                    ├── Postgres (system of record)
+                                    └── Redis   (cache, queues, locks)
+```
 
-> **Phase 4 is complete but dormant.** `WhatsAppPhoneNumber` and
-> `MessageTemplate` are read-only across the codebase — nothing writes either
-> table yet, so in a real deployment `resolveNumber()` always raises
-> `WHATSAPP_NUMBER_NOT_REGISTERED`, `sendTemplate()` cannot find a template, and
-> every verified inbound webhook resolves to `unroutable`. The suites pass
-> because they seed those rows directly. Phase 5 closes this.
+---
 
-### Funding flow
+## Feature surface
+
+| Area | Capability |
+|------|------------|
+| **Custody** | Stellar classic (`G…`) accounts via `stellar-sdk`, deposit watchers with cursor recovery, trustline ensure, idempotent vault spends. Optional Soroban (`C…`) via sister repo. |
+| **On-ramp** | NGN → virtual NUBAN → auto-credit; provider adapters for FalconPay, PayVessel, PulseMFB, Paystack. |
+| **Off-ramp** | USDC → NGN payout to any Nigerian bank; server quote + rate lock + PIN + idempotency. |
+| **P2P transfers** | USDC on Stellar to `G…` address or BANJEE username. |
+| **Bills** | Airtime, data, electricity, TV via SMEPlug / ClubKonnect / PulseMFB with fallback routing and auto-refund on terminal provider failure. |
+| **KYC** | Tiered caps (Bronze → Legend), PayVessel provider, admin queue, matching heuristics. |
+| **Auth** | Phone + PIN (Argon2id, lockout, weak-PIN reject), access/refresh split, session family revocation on reuse detection. |
+| **WhatsApp bot** | Meta Cloud API webhook, intent parser, Flow-based PIN, 24h service-window enforcement, `wamid` dedupe, template sync. |
+| **Admin panel** | Dashboard, members, roles, teams, invitations, API keys, sessions, customers, audit trail — RBAC with deny-wins resolution. |
+| **Observability** | Pino NDJSON with redaction, Prometheus metrics, OpenTelemetry traces; `requestId` as the join key. |
+| **Multi-tenant** | Row-level `tenantId` enforced by a Prisma client extension (fails closed, rejects cross-tenant queries). |
+
+---
+
+## Architecture
+
+**Modular monolith**, deployed as one process, structured so any feature module can be lifted into its own service without touching the others.
+
+```
+core  ←  infrastructure  ←  modules
+```
+
+- `core` is framework glue and domain primitives: errors, context, pagination, DTO envelope, `Money`. Imports nothing from below.
+- `infrastructure` implements ports (Prisma, Redis, observability, security). Imports `core` only.
+- `modules` are features. They may import `core` + `infrastructure` but **never another module's internals** — cross-module communication is through published service interfaces or domain events.
+
+The layering is the escape hatch: if a module later outgrows the monolith, the queue-based seams (BullMQ over Redis) mean moving it to another process is a deployment change, not a redesign.
+
+Full decision log with rejected alternatives: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+
+### Multi-tenancy
+
+Shared database, shared schema, row-level `tenantId`. Isolation is enforced by a Prisma client extension (`src/infrastructure/database/extensions/tenant-scope.extension.ts`) that:
+
+- derives the tenant-scoped model set from DMMF, so a new model added later is protected the moment it declares `tenantId`;
+- injects the tenant into every read `where` and every write payload;
+- **rejects** a query that names a different tenant rather than silently rewriting it;
+- refuses to run when no tenant is in context (fails closed).
+
+Known gaps, documented rather than hidden: `$queryRaw` bypasses the extension, nested creates must pass `tenantId` explicitly, Postgres RLS is the planned second layer.
+
+### Money representation
+
+All amounts are **integer kobo** (`BigInt`), never floats. `₦1,500.50` is `150050`. The `Money` value object in `src/core/money` is the only sanctioned way to construct or combine an amount, and money crosses the wire as a string, never a JS number.
+
+---
+
+## Flows (worth reading before changing anything)
+
+### Naira funding flow
 
 ```
 customer transfers to their NUBAN
         │
         ▼
-provider POSTs /api/v1/webhooks/paystack
-        │  HMAC-SHA512 over the RAW bytes — verified before parsing
+provider POSTs /api/v1/webhooks/{paystack|falconpay|payvessel|pulsemfb}
+        │  HMAC verified over the RAW bytes before parsing
         ▼
 webhook_events row written (dedupe on provider event id)
         │
         ▼
-destination account → userId + tenantId   (unscoped lookup, system context)
+destination account → userId + tenantId  (unscoped lookup, system context)
         │
         ▼
 WalletService.credit()  ── SELECT … FOR UPDATE on the wallet row
-        │                   ledger entry + balance update, one transaction
+        │                   ledger entry + balance update in one transaction
         ▼
-balance updated, statement entry visible
+balance updated, statement entry visible, WhatsApp/web notified
 ```
 
-Every step is idempotent. A redelivered webhook resolves to the existing ledger
-entry and changes nothing. A _failure_ returns non-2xx on purpose — the provider's
-retry is the recovery mechanism, and returning 200 on failure would strand the
-customer's money.
+Every step is idempotent. A redelivered webhook resolves to the existing ledger entry and changes nothing. A *failure* returns non-2xx on purpose — the provider's retry is the recovery mechanism; returning 200 on failure would strand the customer's money.
 
-### Inbound message flow
+### USDC deposit flow (Stellar classic)
+
+```
+customer sends USDC to their Stellar G… deposit address
+        │
+        ▼
+ramp.stellar-watcher polls Horizon (cursor persisted in DB)
+        │
+        ▼
+tx_notify_dedupe on (ledger, tx hash, op index)
+        │
+        ▼
+credit USDC balance; emit deposit event; notify via WhatsApp + web socket
+```
+
+### Sell USDC → NGN
+
+```
+user opens Sell screen  →  server quote (rate + fee locked)
+                       │
+                       ▼
+user enters PIN  →  POST /ramp-portal/sells (Idempotency-Key)
+                       │
+                       ▼
+debit USDC (SELECT…FOR UPDATE)  →  credit NGN  →  payout to bank
+                       │
+                       ▼
+poll payout provider; on terminal failure, auto-refund USDC
+```
+
+### WhatsApp inbound flow
 
 ```
 customer sends a WhatsApp message
@@ -92,35 +153,27 @@ customer sends a WhatsApp message
 Meta POSTs /api/v1/webhooks/whatsapp
         │  HMAC-SHA256 over the RAW bytes — verified before parsing
         ▼
-phone_number_id → our registered number → tenantId   (unscoped, system context)
+phone_number_id → registered number → tenantId  (unscoped, system context)
         │
         ▼
-message stored, keyed on wamid   (@@unique([tenantId, wamid]) — redelivery is a no-op)
+message stored, keyed on wamid  (@@unique([tenantId, wamid]) — redelivery is a no-op)
         │
         ▼
-conversation.lastInboundAt bumped → the 24-hour service window reopens
+conversation.lastInboundAt bumped → 24h service window reopens
+        │
+        ▼
+intent parser routes to ramp commands (send, sell, buy, bills, balance, …)
 ```
 
-Meta redelivers the **entire batch** on any non-2xx, so a single malformed
-message is logged and counted rather than failing the request — otherwise the
-messages that already stored would be resent, and repeated failures make Meta
-disable the subscription outright.
+Meta redelivers the **entire batch** on any non-2xx, so a single malformed message is logged and counted rather than failing the request — otherwise the messages that already stored would be resent, and repeated failures make Meta disable the subscription outright.
 
-### The 24-hour service window
+### 24-hour service window
 
-Free-form messages are permitted only within 24 hours of the customer's last
-inbound message; outside it, only an approved template may be sent. This is
-checked **before** calling Meta, not by reacting to their rejection: a refused
-send still costs a round trip and counts against rate limits, and repeated policy
-violations degrade the number's quality rating, throttling throughput for every
-customer on it.
+Free-form messages are permitted only within 24 hours of the customer's last inbound message; outside it, only an approved template may be sent. This is checked **before** calling Meta, not by reacting to their rejection: a refused send still costs a round trip, counts against rate limits, and repeated policy violations degrade the number's quality rating and throttle throughput for every customer on it.
 
-### Permissions
+### Permissions (RBAC)
 
-Permission slugs are a **compile-time catalogue** in `src/core/authorization`,
-not database rows. They change only when code changes, and a static list makes
-`@RequirePermissions('members:writ')` a build error rather than a route nobody
-can reach. The database stores only which slugs a role grants.
+Permission slugs are a **compile-time catalogue** in `src/core/authorization`, not database rows. They change only when code changes, and a static list makes `@RequirePermissions('members:writ')` a build error rather than a route nobody can reach.
 
 ```
 role.permissions  ─┐
@@ -130,87 +183,40 @@ membership.denied ─┘                                  (denials always win)
 
 Three rules carry most of the weight:
 
-- **Denials beat everything**, including `*`. Otherwise "an administrator who
-  must not move money" requires cloning a role, and clones drift.
-- **Wildcards expand at check time**, never at save time. A permission added in
-  a later release is covered by an existing `*` instead of silently escaping it.
-- **You cannot grant what you do not hold.** Without that check, `roles:write`
-  is equivalent to `*` — write `wallets:adjust` into a role, assign it to
-  yourself. The same rule guards invitations and API keys.
+- **Denials beat everything**, including `*`. Otherwise "an administrator who must not move money" needs a cloned role, and clones drift.
+- **Wildcards expand at check time**, never at save time. A permission added in a later release is covered by an existing `*` instead of silently escaping it.
+- **You cannot grant what you do not hold.** Without that, `roles:write` is equivalent to `*` — write `wallets:adjust` into a role, assign it to yourself. The same rule guards invitations and API keys.
 
-> **Roles are not seeded yet.** `AccessService.seedSystemRoles` creates
-> `owner`/`admin`/`agent`/`analyst` for a workspace, but nothing calls it —
-> there is no tenant provisioning path in the codebase at all (tenants are
-> created out of band today, and there is no signup flow). Until one exists, a
-> brand-new workspace has no roles, so no membership can reference one, and
-> every guarded admin route answers `ROLE_REQUIRED`. Seeding must be wired into
-> whatever creates a tenant; the same call is safe to run against an existing
-> workspace, since it skips duplicates.
+The panel is scoped to the caller's own workspace. A platform-operator console spanning tenants needs `runAsSystem` to bypass the Prisma tenant extension and is deliberately not exposed here.
 
-The panel is scoped to the caller's own workspace. There is deliberately no
-`:tenantId` parameter anywhere in it: a platform-operator console spanning
-tenants needs `runAsSystem` to bypass the Prisma tenant extension, and putting
-that route here would make one missing guard the difference between a workspace
-administrator and a platform administrator.
+---
 
-### Money representation
+## Tech stack
 
-All amounts are **integer kobo** (`BigInt`), never floats. `₦1,500.50` is `150050`.
-The `Money` value object in `src/core/money` is the only sanctioned way to construct
-or combine an amount, and money crosses the wire as a string — never a JS number.
+| Layer | Choice |
+|-------|--------|
+| Runtime | Node ≥ 22 |
+| Framework | NestJS 11 |
+| DB | PostgreSQL via Prisma |
+| Cache / queues / locks | Redis |
+| Auth | JWT (access + refresh), Argon2id PINs, encrypted session store |
+| Chain | `stellar-sdk` (classic), `@stellar/stellar-sdk-contract` (Soroban) |
+| Messaging | Meta WhatsApp Cloud API |
+| Payments / payouts | FalconPay, PayVessel, PulseMFB, Paystack (legacy) |
+| Bills | SMEPlug, ClubKonnect, PulseMFB VAS |
+| KYC | PayVessel |
+| Observability | Pino + Prometheus + OpenTelemetry |
+| HTTP | Response envelope, Zod validation, URI versioning, security headers |
+| Dev | ESLint 9, Prettier, Husky + lint-staged, commitlint |
+| Deploy | Docker multi-stage, Railway (Nginx reverse proxy for ops endpoints) |
 
-## Roadmap
+---
 
-### Phase 5 — onboarding, management API, RBAC
+## Prerequisites
 
-Makes phase 4 reachable. Today the WhatsApp module has no HTTP surface except
-Meta's webhook, and no way to register the rows every code path reads from.
-
-| Deliverable         |                                                                                         |     |
-| ------------------- | --------------------------------------------------------------------------------------- | --- |
-| RBAC enforcement    | Permission catalogue, role→permission resolution, guard on every tenant-facing route    | ✅  |
-| Admin panel         | Dashboard, workspace, members, roles, teams, invitations, API keys, sessions, customers | ✅  |
-| Audit trail         | Append-only writes behind every mutation, plus the read API the panel filters on        | ✅  |
-| Number registration | Register `phone_number_id` + WABA id, verify against Meta, encrypt the access token     |     |
-| Number lifecycle    | Connection status transitions, default-number selection, disconnect                     |     |
-| Template sync       | Pull templates from the Graph API; persist name, language, variable count, status       |     |
-| Messaging API       | Send text and template, quote a message, client idempotency key                         |     |
-| Conversation API    | List threads, fetch a thread with cursor pagination, unread and window state            |     |
-
-The delivered half needed **no migration** — `Role`, `Membership`, `Team`,
-`TeamMember`, `Invitation`, `ApiKey` and `AuditLog` were already in the schema
-and had zero references in `src/`. Phase 5 wired up what phase 1 had modelled.
-
-Templates are **synced, not authored** — Meta owns approval, so the local row is
-a cache of their decision. `bodyVariableCount` must be derived from the body
-text during sync, or `sendTemplate`'s parameter-mismatch check
-(`messaging.service.ts:138`) validates against a number nobody set.
-
-RBAC landed first because it is the floor the rest of the phase stands on.
-Registering an access token and sending on a customer's behalf are precisely the
-operations that need permission checks, and retrofitting guards across a
-finished controller set is strictly worse than writing them alongside — the
-remaining routes get `@RequirePermissions` from their first commit.
-
-### Phase 6 — contacts and the queue backbone
-
-| Deliverable       |                                                                                     |
-| ----------------- | ----------------------------------------------------------------------------------- |
-| Contacts          | New `Contact` model, phone identity, attributes, tags, import                       |
-| Conversation link | Attach threads to contacts, backfilling from `contactPhoneE164`                     |
-| Queue backbone    | BullMQ workers, retry and backoff policy, dead-letter handling, queue depth metrics |
-| Async send path   | Move outbound sends behind a queue so throughput survives Meta's rate limits        |
-
-Contacts are a **schema addition**, not a wiring job: `Conversation` currently
-keys on `contactPhoneE164` directly, with no contact entity behind it.
-
-Both land before campaigns because a campaign is a contact segment plus a bulk
-send, and a bulk send that runs in the request path will hit
-`WHATSAPP_RATE_LIMITED` and lose the remainder of the batch. Redis already runs
-with `maxmemory-policy noeviction` for exactly this reason.
-
-**Phase 7+**, unscoped: campaigns, automation, AI, realtime, outbound
-transfers/withdrawals.
+- Node ≥ 22
+- Docker + Docker Compose (for Postgres + Redis)
+- A WhatsApp Business account + Meta app + `META_APP_SECRET` (for live WhatsApp flows — optional for local dev)
 
 ---
 
@@ -220,14 +226,14 @@ transfers/withdrawals.
 # 1. Configuration
 cp .env.example .env
 # Generate real secrets — the app refuses to start in staging/production with placeholders.
-echo "ENCRYPTION_KEY=$(openssl rand -base64 32)" >> .env
-echo "JWT_ACCESS_SECRET=$(openssl rand -base64 48)" >> .env
+echo "ENCRYPTION_KEY=$(openssl rand -base64 32)"   >> .env
+echo "JWT_ACCESS_SECRET=$(openssl rand -base64 48)"  >> .env
 echo "JWT_REFRESH_SECRET=$(openssl rand -base64 48)" >> .env
 
-# 2. Infrastructure
+# 2. Infrastructure (Postgres + Redis)
 docker compose up -d
 
-# 3. Dependencies and database
+# 3. Dependencies + database
 npm ci
 npx prisma generate
 npx prisma migrate dev
@@ -243,9 +249,7 @@ npm run start:dev
 | `http://localhost:3000/health`  | Health detail                    |
 | `http://localhost:3000/metrics` | Prometheus metrics               |
 
----
-
-## Commands
+### Scripts
 
 ```bash
 npm run start:dev        # watch mode
@@ -256,54 +260,83 @@ npm run lint             # ESLint
 npm run typecheck        # tsc --noEmit
 npm run format           # Prettier write
 
-npm test                 # unit tests
-npm run test:cov         # unit tests with coverage
-npm run test:e2e         # end-to-end tests
+npm test                 # unit tests (Jest)
+npm run test:cov         # unit tests + coverage
+npm run test:e2e         # end-to-end suite
 
-npx prisma migrate dev   # create and apply a migration
+npx prisma migrate dev   # create + apply a migration
 npx prisma studio        # browse the database
 ```
 
 ---
 
-## Layout
+## Project layout
 
 ```
 src/
-├── config/            Env validation and the typed config tree
+├── config/            Env validation (fail-fast) and the typed config tree
 ├── core/              Framework-agnostic kernel — imports nothing below it
-│   ├── authorization/ Permission catalogue and grant resolution
-│   ├── constants/     Header names and shared literals
+│   ├── authorization/ Permission catalogue + grant resolution
+│   ├── constants/     Header names + shared literals
 │   ├── context/       AsyncLocalStorage request context
-│   ├── decorators/    @SkipResponseEnvelope, @RequestTimeout
+│   ├── decorators/    @SkipResponseEnvelope, @RequestTimeout, @Public
 │   ├── dto/           Response envelope, pagination
 │   ├── errors/        ErrorCode catalogue, AppException, translator registry
 │   ├── filters/       Global exception filter
-│   ├── interceptors/  Envelope, timeout
+│   ├── interceptors/  Envelope + timeout
 │   ├── money/         Integer-kobo value object
 │   └── utils/         Cursor codec, E.164 phone normalisation
+│
 ├── infrastructure/    Adapters to the outside world
-│   ├── cache/         Redis client, key namespacing, cache service
-│   ├── database/      Prisma service, tenancy + soft-delete extensions
-│   └── observability/ Logging, metrics, tracing
+│   ├── cache/         Redis client, key namespacing, cache service, distributed locks
+│   ├── database/      Prisma service, tenancy + soft-delete extensions, exception translator
+│   ├── observability/ Pino logger, Prometheus metrics, OpenTelemetry tracing
+│   └── security/      Crypto + hashing services
+│
 ├── modules/           Feature modules
-│   ├── admin/         Back-office panel, one folder per screen
-│   ├── auth/          Customer and admin authentication, sessions
-│   ├── payments/      Provider abstraction, Paystack adapter, funding webhooks
-│   ├── tenancy/       Tenant resolution from header or subdomain
-│   ├── wallet/        Balances, double-entry ledger, money movement
-│   └── whatsapp/      Cloud API client, inbound webhook, sending, conversations
+│   ├── admin/         Back-office — dashboard, workspace, members, roles, teams, invitations, API keys, sessions, customers, audit
+│   ├── auth/          Customer + admin auth, tokens, guards
+│   ├── bills/         Airtime / data / electricity / TV — SMEPlug, ClubKonnect, PulseMFB-VAS, FalconPay-bills, routed fallback
+│   ├── health/        liveness / readiness / detail probes
+│   ├── kyc/           Tiers, matching, PayVessel adapter, admin queue
+│   ├── payments/      Provider abstraction, funding, payouts — FalconPay, PayVessel, PulseMFB, Paystack
+│   ├── profile/       User profile
+│   ├── ramp/          The money-movement core: Stellar wallets + watchers, portal controller, rates, bills, bank sends, receipts, statements, Celo (opt-in), WhatsApp integration
+│   ├── rewards/       Referrals + reward rules
+│   ├── tenancy/       Tenant resolution (header / subdomain)
+│   ├── wallet/        Balances + double-entry ledger
+│   └── whatsapp/      Cloud API client, inbound webhook, send service, template sync, conversations
+│
 ├── bootstrap/         App configuration shared by main.ts and e2e tests
+├── app.module.ts
 └── main.ts
-
-prisma/schema.prisma   Data model
-test/                  End-to-end suites
-docker/nginx/          Reverse proxy configuration
-docs/ARCHITECTURE.md   Decisions and trade-offs
 ```
 
-Dependency direction is enforced by convention and reviewed in PRs:
-`core ← infrastructure ← modules`. `core` never imports the others.
+Supporting:
+
+```
+prisma/schema.prisma   Data model + 20+ migrations
+test/                  End-to-end suites (auth, http pipeline, webhook, whatsapp, admin, probe)
+flows/                 WhatsApp Meta Flow JSON (onboard, PIN confirm)
+docker/nginx/          Reverse-proxy config (restricts /metrics + /docs to private networks)
+docs/ARCHITECTURE.md   Decisions and trade-offs
+scripts/               Deploy helpers (Railway start script)
+```
+
+### Module map — where to look for what
+
+| You want to change… | Start in |
+|---------------------|----------|
+| How a Naira deposit lands | `src/modules/payments/*-webhook.controller.ts` → `funding.service.ts` → `wallet/wallet.service.ts` |
+| How a USDC send is signed | `src/modules/ramp/ramp.stellar-wallet.ts`, `ramp.stellar-classic.ts` |
+| USDC deposit detection | `src/modules/ramp/ramp.stellar-watcher.ts` (+ `ramp.celo-watcher.ts` for Celo opt-in) |
+| Sell USDC → NGN pipeline | `src/modules/ramp/ramp-portal.service.ts` + `payments/payout.service.ts` |
+| A new bills provider | `src/modules/bills/<provider>.provider.ts` + `routed-bills.provider.ts` for fallback |
+| WhatsApp intent parsing | `src/modules/ramp/ramp.intent.ts`, `ramp.commands.ts`, `ramp.bank-parse.ts` |
+| Rate curves + spreads | `src/modules/ramp/ramp-rates.service.ts`, `ramp-rates.admin.controller.ts` |
+| KYC tier limits | `src/modules/kyc/kyc.tiers.ts` |
+| A new permission | `src/core/authorization/permission.enum.ts` (compile-time) |
+| Admin RBAC enforcement | `src/modules/admin/access/*` |
 
 ---
 
@@ -324,42 +357,80 @@ Every response uses the same envelope:
 }
 ```
 
-- **Branch on `error.code`**, never on the HTTP status or the message text. Codes
-  are append-only; messages may be reworded at any time.
+- **Branch on `error.code`**, never on HTTP status or message text. Codes are append-only; messages may be reworded.
 - `retryable` says whether replaying the identical request may succeed.
 - List endpoints use cursor pagination — pass `meta.nextCursor` back as `cursor`.
-- Mutating endpoints accept an `Idempotency-Key` header.
-- Quote `requestId` in a support ticket; it maps to the server trace.
+- Mutating endpoints accept an `Idempotency-Key` header. Three-layer idempotency: request key, provider dedupe, ledger uniqueness.
+- Quote `requestId` in a support ticket; it maps directly to the server trace.
+- URI versioning (`/api/v1/...`) — visible in logs, CDN rules and bug reports.
 
 ---
 
-## Notes for operators
+## Testing
 
-- `/metrics` and `/docs` must not be publicly reachable. The supplied nginx
-  configuration restricts both to private networks.
-- `TRUST_PROXY_HOPS` must match the number of proxies in front of the app.
-  Setting it too high lets clients forge `X-Forwarded-For` and evade rate limits;
-  too low and every client appears to share the proxy's IP.
-- Total database connections are `DB_POOL_SIZE × processes`. Keep the product
-  below Postgres' `max_connections`, or add PgBouncer in transaction mode.
-- Redis runs with `maxmemory-policy noeviction` on purpose: queue state lives
-  there, and silently evicting a key would lose queued messages.
-- `SHUTDOWN_TIMEOUT_MS` must be lower than the orchestrator's termination grace
-  period, or pods are killed mid-drain.
-- `META_APP_SECRET` is the WhatsApp webhook's only authentication. Rotating it in
-  the Meta dashboard without updating the app makes every delivery fail
-  signature verification, and Meta disables the subscription after repeated
-  failures. Deploy the new value first, then rotate.
-- WhatsApp access tokens are encrypted at rest with `ENCRYPTION_KEY`. Changing
-  that key without re-encrypting makes every registered number unable to send.
+```bash
+npm test                 # unit tests
+npm run test:cov         # with coverage
+npm run test:e2e         # end-to-end (uses the e2e Jest config, --runInBand)
+```
+
+E2E suites live in `test/` and use `test/setup-env.ts` to seed a disposable database. There are 350+ unit tests and 90+ e2e covering: auth, http pipeline, webhook signature + replay, WhatsApp parsing + sending, admin RBAC, probe.
 
 ---
 
-## Local Docker permissions
+## Deployment
 
-If `docker compose up` reports a permission error on `/var/run/docker.sock`, add
-yourself to the `docker` group once:
+Production runs on **Railway** with the multi-stage [`Dockerfile`](Dockerfile). The accompanying `docker/nginx/nginx.conf` restricts `/metrics` and `/docs` to private networks.
+
+Steps for a fresh deploy:
+
+1. Provision Postgres + Redis addons.
+2. Set the env from `.env.example` — generate real `ENCRYPTION_KEY`, `JWT_ACCESS_SECRET`, `JWT_REFRESH_SECRET`; the app refuses to start in staging/production with placeholders.
+3. `prisma migrate deploy` runs on release via `scripts/railway-start.sh`.
+4. Allowlist the deployed frontend origin in `CORS_ORIGINS`.
+5. Configure the Meta WhatsApp webhook to `https://<your-host>/api/v1/webhooks/whatsapp` and set `META_APP_SECRET` **before** rotating in the Meta dashboard — rotating first causes every delivery to fail signature verification, and Meta disables the subscription after repeated failures.
+
+---
+
+## Operator notes
+
+- `/metrics` and `/docs` must not be publicly reachable. The supplied Nginx config restricts both to private networks.
+- `TRUST_PROXY_HOPS` must match the number of proxies in front of the app. Too high lets clients forge `X-Forwarded-For` and evade rate limits; too low and every client appears to share the proxy's IP.
+- Total database connections are `DB_POOL_SIZE × processes`. Keep the product below Postgres' `max_connections`, or add PgBouncer in transaction mode.
+- Redis runs with `maxmemory-policy noeviction` on purpose: queue state lives there, and silently evicting a key would lose queued messages.
+- `SHUTDOWN_TIMEOUT_MS` must be lower than the orchestrator's termination grace period, or pods are killed mid-drain.
+- WhatsApp access tokens are encrypted at rest with `ENCRYPTION_KEY`. Changing that key without re-encrypting disables every registered number.
+
+### Local Docker permissions
+
+If `docker compose up` reports a permission error on `/var/run/docker.sock`:
 
 ```bash
 sudo usermod -aG docker "$USER"   # then log out and back in
 ```
+
+---
+
+## Contributing
+
+Issues are scoped per repo and labeled (`backend`, `good-first-issue`, `test`, `docs`, `stellar`, …). Each issue states acceptance criteria and links the files involved.
+
+1. Fork, branch from `main`.
+2. Make the change — add or update unit + e2e coverage.
+3. `npm run lint && npm run typecheck && npm test && npm run test:e2e` must pass.
+4. Open a PR; link the issue.
+5. Secrets never go in commits — only `.env.example` ships.
+
+PRs that touch money paths (`ramp/`, `payments/`, `bills/`, `wallet/`) require a second reviewer and must include test fixtures for both the happy path and the provider-failure path.
+
+---
+
+## Related documents
+
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — decisions with rejected alternatives
+- [Frontend](https://github.com/Zylo-Finace/frontend) — web wallet
+- [Contracts](https://github.com/Zylo-Finace/contract) — Soroban `ZyloFactory` + `ZyloWallet`
+
+## License
+
+UNLICENSED — all rights reserved. Contact the maintainers for commercial use.
